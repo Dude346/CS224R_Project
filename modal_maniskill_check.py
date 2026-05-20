@@ -28,7 +28,7 @@ image = (
 
 
 @app.function(image=image, gpu="T4", timeout=600)
-def smoke_test() -> bytes:
+def smoke_test(env_id: str = "StackCube-v1") -> bytes:
     import io
     import numpy as np
     import gymnasium as gym
@@ -36,8 +36,9 @@ def smoke_test() -> bytes:
     from PIL import Image
 
     print(f"mani_skill version: {mani_skill.__version__}")
+    print(f"env: {env_id}")
 
-    env = gym.make("StackCube-v1", render_mode="rgb_array")
+    env = gym.make(env_id, render_mode="rgb_array")
     obs, info = env.reset(seed=0)
     for _ in range(20):
         action = env.action_space.sample()
@@ -61,8 +62,9 @@ def smoke_test() -> bytes:
 
 @app.local_entrypoint()
 def main():
-    png_bytes = smoke_test.remote()
-    out_path = "stackcube_smoke.png"
-    with open(out_path, "wb") as f:
-        f.write(png_bytes)
-    print(f"saved {len(png_bytes)} bytes to {out_path}")
+    for env_id in ["StackCube-v1", "PickCube-v1"]:
+        png_bytes = smoke_test.remote(env_id)
+        out_path = f"{env_id.lower().replace('-', '_')}_smoke.png"
+        with open(out_path, "wb") as f:
+            f.write(png_bytes)
+        print(f"saved {len(png_bytes)} bytes to {out_path}")

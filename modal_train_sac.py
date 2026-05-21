@@ -51,7 +51,7 @@ def train_sac(
     num_envs: int = 32,
     buffer_size: int = 500_000,
     eval_freq: int = 50_000,
-    control_mode: str = "pd_ee_delta_pos",
+    control_mode: str = "pd_joint_delta_pos",
     utd: float = 0.5,
     exp_name: str | None = None,
     wandb_project: str = "cs224r-project",

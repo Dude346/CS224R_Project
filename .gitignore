@@ -224,4 +224,5 @@ __marimo__/
 *.mp4
 *_smoke.png
 run_artifacts/
+run_artifacts_*/
 videos/

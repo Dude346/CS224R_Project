@@ -14,7 +14,7 @@ from mani_skill.envs.tasks.tabletop.pick_cube import PickCubeEnv
 from mani_skill.envs.tasks.tabletop.pick_cube_cfgs import PICK_CUBE_CONFIGS
 from mani_skill.envs.tasks.tabletop.stack_cube import StackCubeEnv
 
-DEFAULT_WEAK_PANDA_FORCE_SCALE = 0.3
+DEFAULT_WEAK_PANDA_FORCE_SCALE = 0.6
 
 
 @register_agent()

@@ -1,6 +1,12 @@
+from __future__ import annotations
+
+from pathlib import Path
+
 import modal
 
 app = modal.App("train-sac")
+PROJECT_ROOT = Path(__file__).parent
+REMOTE_ROOT = "/root/project"
 
 image = (
     modal.Image.from_registry(
@@ -23,7 +29,13 @@ image = (
         "clang",
         "build-essential",
     )
-    .pip_install("torch", "mani_skill", "pillow", "wandb", "tensorboard")
+    .pip_install("modal>=1.4.3", "torch", "mani_skill", "pillow", "wandb", "tensorboard")
+    .env(
+        {
+            "MS_SKIP_ASSET_DOWNLOAD_PROMPT": "1",
+            "WANDB_DIR": "/output/wandb",
+        }
+    )
     .run_commands(
         "git clone --depth 1 https://github.com/haosulab/ManiSkill.git /root/ManiSkill",
     )
@@ -31,6 +43,21 @@ image = (
         "mkdir -p /usr/share/vulkan/icd.d /usr/share/glvnd/egl_vendor.d",
         """echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libGLX_nvidia.so.0","api_version":"1.3.194"}}' > /usr/share/vulkan/icd.d/nvidia_icd.json""",
         """echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' > /usr/share/glvnd/egl_vendor.d/10_nvidia.json""",
+    )
+    .workdir(REMOTE_ROOT)
+    .add_local_dir(
+        str(PROJECT_ROOT),
+        remote_path=REMOTE_ROOT,
+        ignore=[
+            ".git",
+            ".pytest_cache",
+            ".venv",
+            "__pycache__",
+            "*.mp4",
+            "*_smoke.png",
+            "bad_res_smoke_frames",
+            "checkpoints",
+        ],
     )
 )
 
@@ -46,6 +73,7 @@ volume = modal.Volume.from_name("cs224r-project-results", create_if_missing=True
 )
 def train_sac(
     env_id: str = "PickCube-v1",
+    robot_uids: str = "panda",
     seed: int = 1,
     total_timesteps: int = 500_000,
     num_envs: int = 32,
@@ -62,7 +90,10 @@ def train_sac(
     import threading
 
     if exp_name is None:
-        exp_name = f"sac_{env_id.replace('-', '_')}_panda_seed{seed}_{total_timesteps}steps"
+        control_tag = control_mode.replace('-', '_')
+        exp_name = (
+            f"sac_{env_id.replace('-', '_')}_{robot_uids}_{control_tag}_seed{seed}_{total_timesteps}steps"
+        )
 
     cmd = [
         "python",
@@ -81,6 +112,14 @@ def train_sac(
     ]
     print("Running:", " ".join(cmd))
 
+    subprocess_env = os.environ.copy()
+    subprocess_env["PYTHONPATH"] = f"{REMOTE_ROOT}:{subprocess_env.get('PYTHONPATH', '')}".rstrip(":")
+    subprocess_env["WANDB_DIR"] = "/output/wandb"
+    if robot_uids != "panda":
+        subprocess_env["CS224R_ENABLE_WEAK_GRIPPER"] = "1"
+        subprocess_env["CS224R_ROBOT_UIDS"] = robot_uids
+        subprocess_env["CS224R_TARGET_ENV_IDS"] = "PickCube-v1,StackCube-v1"
+
     # Background thread: periodically commit the volume so an unexpected
     # crash mid-training doesn't lose every checkpoint written so far.
     stop_event = threading.Event()
@@ -97,7 +136,7 @@ def train_sac(
     commit_thread.start()
 
     try:
-        subprocess.run(cmd, cwd="/output", check=True)
+        subprocess.run(cmd, cwd="/output", env=subprocess_env, check=True)
     finally:
         stop_event.set()
         commit_thread.join(timeout=10)
@@ -122,15 +161,19 @@ def train_sac(
 @app.local_entrypoint()
 def main(
     env_id: str = "PickCube-v1",
+    robot_uids: str = "panda",
     seed: int = 1,
     total_timesteps: int = 500_000,
     eval_freq: int = 50_000,
+    control_mode: str = "pd_ee_delta_pos",
 ):
     run_name, video_bytes = train_sac.remote(
         env_id=env_id,
+        robot_uids=robot_uids,
         seed=seed,
         total_timesteps=total_timesteps,
         eval_freq=eval_freq,
+        control_mode=control_mode,
     )
     print(f"Training complete. Run name: {run_name}")
     if video_bytes:
@@ -145,19 +188,27 @@ def main(
 @app.local_entrypoint()
 def launch(
     env_id: str = "PickCube-v1",
+    robot_uids: str = "panda",
     seed: int = 1,
     total_timesteps: int = 500_000,
     eval_freq: int = 50_000,
+    control_mode: str = "pd_ee_delta_pos",
 ):
     fc = train_sac.spawn(
         env_id=env_id,
+        robot_uids=robot_uids,
         seed=seed,
         total_timesteps=total_timesteps,
         eval_freq=eval_freq,
+        control_mode=control_mode,
     )
-    exp_name = f"sac_{env_id.replace('-', '_')}_panda_seed{seed}_{total_timesteps}steps"
+    control_tag = control_mode.replace('-', '_')
+    exp_name = f"sac_{env_id.replace('-', '_')}_{robot_uids}_{control_tag}_seed{seed}_{total_timesteps}steps"
     print(f"Spawned function call: {fc.object_id}")
     print(f"Run name: {exp_name}")
-    print(f"Monitor logs: uv run modal app logs train-sac")
-    print(f"After completion, fetch video with:")
-    print(f"  uv run modal volume get cs224r-project-results runs/{exp_name}/videos ./videos")
+    print("Preferred detached command is:")
+    print(
+        f"  uv run modal run -d modal_train_sac.py::train_sac --env-id {env_id} --robot-uids {robot_uids} --seed {seed} --total-timesteps {total_timesteps} --eval-freq {eval_freq} --control-mode {control_mode}"
+    )
+    print("After completion, fetch video with:")
+    print(f"  .venv/bin/modal volume get cs224r-project-results /runs/{exp_name}/videos ./videos")

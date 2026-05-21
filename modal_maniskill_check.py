@@ -53,7 +53,7 @@ image = (
 @app.function(image=image, gpu="T4", timeout=600)
 def smoke_test(
     env_id: str = "StackCube-v1",
-    robot_uids: str = "weakpanda",
+    robot_uids: str = "panda",
     obs_mode: str = "state+rgb",
     seed: int = 0,
     num_steps: int = 20,
@@ -99,20 +99,24 @@ def smoke_test(
 
 @app.local_entrypoint()
 def main(
-    env_id: str = "StackCube-v1",
-    robot_uids: str = "weakpanda",
+    env_id: str = "",
+    robot_uids: str = "panda",
     obs_mode: str = "state+rgb",
     seed: int = 0,
     num_steps: int = 20,
 ):
-    png_bytes = smoke_test.remote(
-        env_id=env_id,
-        robot_uids=robot_uids,
-        obs_mode=obs_mode,
-        seed=seed,
-        num_steps=num_steps,
-    )
-    out_path = f"{env_id}_{robot_uids}_smoke.png"
-    with open(out_path, "wb") as f:
-        f.write(png_bytes)
-    print(f"saved {len(png_bytes)} bytes to {out_path}")
+    env_ids = [env_id] if env_id else ["StackCube-v1", "PickCube-v1"]
+    suffix = "" if robot_uids == "panda" else f"_{robot_uids}"
+
+    for current_env_id in env_ids:
+        png_bytes = smoke_test.remote(
+            env_id=current_env_id,
+            robot_uids=robot_uids,
+            obs_mode=obs_mode,
+            seed=seed,
+            num_steps=num_steps,
+        )
+        out_path = f"{current_env_id.lower().replace('-', '_')}{suffix}_smoke.png"
+        with open(out_path, "wb") as f:
+            f.write(png_bytes)
+        print(f"saved {len(png_bytes)} bytes to {out_path}")

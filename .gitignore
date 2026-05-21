@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# Project artifacts (regenerable from Modal volume / smoke tests)
+*.mp4
+*_smoke.png
+run_artifacts/
+videos/

@@ -91,7 +91,7 @@ def run_env_smoke(
     """Create a ManiSkill env, reset it, and step a few random actions."""
     import gymnasium as gym
     import mani_skill.envs  # noqa: F401 - registers ManiSkill envs with gymnasium
-    import cs224r_project.mani_skill_ext  # noqa: F401 - registers custom robots
+    import weak_panda  # noqa: F401 - registers custom robots
 
     if env_id not in SUPPORTED_ENVS:
         supported = ", ".join(SUPPORTED_ENVS)

@@ -2,7 +2,7 @@ from mani_skill.agents.registration import REGISTERED_AGENTS
 from mani_skill.envs.tasks.tabletop.pick_cube import PickCubeEnv
 from mani_skill.envs.tasks.tabletop.stack_cube import StackCubeEnv
 
-from cs224r_project.mani_skill_ext import (
+from weak_panda import (
     DEFAULT_WEAK_PANDA_FORCE_SCALE,
     WeakPanda,
     WeakPandaWristCam,

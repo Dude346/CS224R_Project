@@ -32,6 +32,6 @@ def _patch_gym_make() -> None:
 
 if os.environ.get("CS224R_ENABLE_WEAK_GRIPPER") == "1":
     import mani_skill.envs  # noqa: F401
-    import cs224r_project.mani_skill_ext  # noqa: F401
+    import weak_panda  # noqa: F401
 
     _patch_gym_make()

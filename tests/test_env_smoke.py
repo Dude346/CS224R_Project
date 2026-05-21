@@ -1,6 +1,6 @@
 import pytest
 
-from cs224r_project.smoke import (
+from smoke import (
     DEFAULT_OBS_MODE,
     SUPPORTED_ENVS,
     run_env_smoke,

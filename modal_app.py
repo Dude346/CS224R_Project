@@ -61,7 +61,7 @@ def smoke_test_env(
     robot_uids: str = "panda",
     save_first_frame: bool = True,
 ) -> dict[str, object]:
-    from cs224r_project.smoke import run_env_smoke
+    from smoke import run_env_smoke
 
     result = run_env_smoke(
         env_id=env_id,

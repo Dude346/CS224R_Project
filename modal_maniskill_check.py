@@ -63,7 +63,7 @@ def smoke_test(
     import gymnasium as gym
     import mani_skill  # noqa: F401  -- import registers ManiSkill envs with gym
     from PIL import Image
-    import cs224r_project.mani_skill_ext  # noqa: F401 - registers weak Panda robots
+    import weak_panda  # noqa: F401 - registers weak Panda robots
 
     print(f"mani_skill version: {mani_skill.__version__}")
     print(f"task: {env_id}, robot_uids: {robot_uids}, obs_mode: {obs_mode}")

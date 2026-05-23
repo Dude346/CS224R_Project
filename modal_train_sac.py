@@ -67,7 +67,7 @@ volume = modal.Volume.from_name("cs224r-project-results", create_if_missing=True
 @app.function(
     image=image,
     gpu="T4",
-    timeout=5 * 60 * 60,
+    timeout=15 * 60 * 60,
     volumes={"/output": volume},
     secrets=[modal.Secret.from_name("wandb-secret")],
 )
@@ -83,17 +83,30 @@ def train_sac(
     utd: float = 0.5,
     exp_name: str | None = None,
     wandb_project: str = "cs224r-project",
+    checkpoint_data: bytes | None = None,
+    perturbation_tag: str = "",
 ) -> tuple[str, bytes]:
     import glob
     import os
     import subprocess
+    import tempfile
     import threading
 
     if exp_name is None:
         control_tag = control_mode.replace('-', '_')
+        prefix = "ft_" if checkpoint_data is not None else ""
+        suffix = f"_{perturbation_tag}" if perturbation_tag else ""
         exp_name = (
-            f"sac_{env_id.replace('-', '_')}_{robot_uids}_{control_tag}_seed{seed}_{total_timesteps}steps"
+            f"{prefix}sac_{env_id.replace('-', '_')}_{robot_uids}_{control_tag}_seed{seed}_{total_timesteps}steps{suffix}"
         )
+
+    ckpt_arg: list[str] = []
+    if checkpoint_data is not None:
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            f.write(checkpoint_data)
+            ckpt_path = f.name
+        ckpt_arg = [f"--checkpoint={ckpt_path}"]
+        print(f"Fine-tuning from checkpoint at {ckpt_path} ({len(checkpoint_data)} bytes)")
 
     cmd = [
         "python",
@@ -109,7 +122,7 @@ def train_sac(
         f"--exp_name={exp_name}",
         f"--wandb_project_name={wandb_project}",
         "--track",
-    ]
+    ] + ckpt_arg
     print("Running:", " ".join(cmd))
 
     subprocess_env = os.environ.copy()
@@ -166,7 +179,12 @@ def main(
     total_timesteps: int = 500_000,
     eval_freq: int = 50_000,
     control_mode: str = "pd_ee_delta_pos",
+    checkpoint_path: str = "",
+    perturbation_tag: str = "",
 ):
+    checkpoint_data = Path(checkpoint_path).read_bytes() if checkpoint_path else None
+    if checkpoint_data is not None:
+        print(f"Loaded {len(checkpoint_data)} bytes from {checkpoint_path}")
     run_name, video_bytes = train_sac.remote(
         env_id=env_id,
         robot_uids=robot_uids,
@@ -174,6 +192,8 @@ def main(
         total_timesteps=total_timesteps,
         eval_freq=eval_freq,
         control_mode=control_mode,
+        checkpoint_data=checkpoint_data,
+        perturbation_tag=perturbation_tag,
     )
     print(f"Training complete. Run name: {run_name}")
     if video_bytes:
@@ -193,7 +213,12 @@ def launch(
     total_timesteps: int = 500_000,
     eval_freq: int = 50_000,
     control_mode: str = "pd_ee_delta_pos",
+    checkpoint_path: str = "",
+    perturbation_tag: str = "",
 ):
+    checkpoint_data = Path(checkpoint_path).read_bytes() if checkpoint_path else None
+    if checkpoint_data is not None:
+        print(f"Loaded {len(checkpoint_data)} bytes from {checkpoint_path}")
     fc = train_sac.spawn(
         env_id=env_id,
         robot_uids=robot_uids,
@@ -201,9 +226,13 @@ def launch(
         total_timesteps=total_timesteps,
         eval_freq=eval_freq,
         control_mode=control_mode,
+        checkpoint_data=checkpoint_data,
+        perturbation_tag=perturbation_tag,
     )
     control_tag = control_mode.replace('-', '_')
-    exp_name = f"sac_{env_id.replace('-', '_')}_{robot_uids}_{control_tag}_seed{seed}_{total_timesteps}steps"
+    prefix = "ft_" if checkpoint_data is not None else ""
+    suffix = f"_{perturbation_tag}" if perturbation_tag else ""
+    exp_name = f"{prefix}sac_{env_id.replace('-', '_')}_{robot_uids}_{control_tag}_seed{seed}_{total_timesteps}steps{suffix}"
     print(f"Spawned function call: {fc.object_id}")
     print(f"Run name: {exp_name}")
     print("Preferred detached command is:")

@@ -14,13 +14,13 @@ from mani_skill.envs.tasks.tabletop.pick_cube import PickCubeEnv
 from mani_skill.envs.tasks.tabletop.pick_cube_cfgs import PICK_CUBE_CONFIGS
 from mani_skill.envs.tasks.tabletop.stack_cube import StackCubeEnv
 
-DEFAULT_WEAK_PANDA_FORCE_SCALE = 0.95
+DEFAULT_WEAK_PANDA_FORCE_SCALE = 0.75
 
 # Tune this single number to experiment with the damped-gripper embodiment.
 #  <1.0  → snappier / less viscous gripper (may oscillate or overshoot)
 #  >1.0  → sluggish / more viscous gripper (slower to close, more damped)
 #  =1.0  → identical to stock Panda (no perturbation)
-DEFAULT_DAMPED_PANDA_DAMPING_SCALE = 2.0
+DEFAULT_DAMPED_PANDA_DAMPING_SCALE = 1.5
 
 # Tune this single number to experiment with the scaled-action embodiment.
 # Scales the arm's per-step joint-delta bounds for pd_joint_delta_pos control.
@@ -70,6 +70,36 @@ class DampedPandaWristCam(PandaWristCam):
 
     uid = "dampedpanda_wristcam"
     keyframes = PandaWristCam.keyframes
+    gripper_damping = (
+        PandaWristCam.gripper_damping * DEFAULT_DAMPED_PANDA_DAMPING_SCALE
+    )
+
+
+@register_agent()
+class WeakDampedPanda(Panda):
+    """Panda robot with BOTH reduced gripper force AND modified gripper damping.
+
+    Compound perturbation for the additive-effects ablation: stacks WeakPanda's
+    force scale and DampedPanda's damping scale on the same robot. Uses the
+    existing DEFAULT_WEAK_PANDA_FORCE_SCALE and DEFAULT_DAMPED_PANDA_DAMPING_SCALE
+    constants so single-variable and compound experiments share scale values.
+    """
+
+    uid = "weakdampedpanda"
+    keyframes = Panda.keyframes
+    gripper_force_limit = Panda.gripper_force_limit * DEFAULT_WEAK_PANDA_FORCE_SCALE
+    gripper_damping = Panda.gripper_damping * DEFAULT_DAMPED_PANDA_DAMPING_SCALE
+
+
+@register_agent()
+class WeakDampedPandaWristCam(PandaWristCam):
+    """Wrist-camera Panda with both gripper-force and gripper-damping perturbations."""
+
+    uid = "weakdampedpanda_wristcam"
+    keyframes = PandaWristCam.keyframes
+    gripper_force_limit = (
+        PandaWristCam.gripper_force_limit * DEFAULT_WEAK_PANDA_FORCE_SCALE
+    )
     gripper_damping = (
         PandaWristCam.gripper_damping * DEFAULT_DAMPED_PANDA_DAMPING_SCALE
     )
@@ -126,6 +156,8 @@ def _register_task_support() -> None:
         "weakpanda_wristcam",
         "dampedpanda",
         "dampedpanda_wristcam",
+        "weakdampedpanda",
+        "weakdampedpanda_wristcam",
         "scaledpanda",
         "scaledpanda_wristcam",
     ):
@@ -197,6 +229,8 @@ def _patch_table_scene_builder() -> None:
         "weakpanda_wristcam": "panda_wristcam",
         "dampedpanda": "panda",
         "dampedpanda_wristcam": "panda_wristcam",
+        "weakdampedpanda": "panda",
+        "weakdampedpanda_wristcam": "panda_wristcam",
         "scaledpanda": "panda",
         "scaledpanda_wristcam": "panda_wristcam",
     }

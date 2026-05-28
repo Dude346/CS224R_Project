@@ -29,7 +29,7 @@ image = (
         "clang",
         "build-essential",
     )
-    .pip_install("torch", "gymnasium", "mani_skill", "pillow")
+    .pip_install("modal>=1.4.3", "torch", "gymnasium", "mani_skill", "pillow")
     .env(
         {
             "PYTHONPATH": REMOTE_ROOT,

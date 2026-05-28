@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
+from typing import Optional
 
 import modal
 
@@ -81,9 +83,9 @@ def train_sac(
     eval_freq: int = 50_000,
     control_mode: str = "pd_joint_delta_pos",
     utd: float = 0.5,
-    exp_name: str | None = None,
+    exp_name: Optional[str] = None,
     wandb_project: str = "cs224r-project",
-    checkpoint_data: bytes | None = None,
+    checkpoint_b64: str = "",
     perturbation_tag: str = "",
 ) -> tuple[str, bytes]:
     import glob
@@ -91,6 +93,8 @@ def train_sac(
     import subprocess
     import tempfile
     import threading
+
+    checkpoint_data = base64.b64decode(checkpoint_b64) if checkpoint_b64 else None
 
     if exp_name is None:
         control_tag = control_mode.replace('-', '_')
@@ -183,6 +187,7 @@ def main(
     perturbation_tag: str = "",
 ):
     checkpoint_data = Path(checkpoint_path).read_bytes() if checkpoint_path else None
+    checkpoint_b64 = base64.b64encode(checkpoint_data).decode("ascii") if checkpoint_data is not None else ""
     if checkpoint_data is not None:
         print(f"Loaded {len(checkpoint_data)} bytes from {checkpoint_path}")
     run_name, video_bytes = train_sac.remote(
@@ -192,7 +197,7 @@ def main(
         total_timesteps=total_timesteps,
         eval_freq=eval_freq,
         control_mode=control_mode,
-        checkpoint_data=checkpoint_data,
+        checkpoint_b64=checkpoint_b64,
         perturbation_tag=perturbation_tag,
     )
     print(f"Training complete. Run name: {run_name}")
@@ -217,6 +222,7 @@ def launch(
     perturbation_tag: str = "",
 ):
     checkpoint_data = Path(checkpoint_path).read_bytes() if checkpoint_path else None
+    checkpoint_b64 = base64.b64encode(checkpoint_data).decode("ascii") if checkpoint_data is not None else ""
     if checkpoint_data is not None:
         print(f"Loaded {len(checkpoint_data)} bytes from {checkpoint_path}")
     fc = train_sac.spawn(
@@ -226,11 +232,11 @@ def launch(
         total_timesteps=total_timesteps,
         eval_freq=eval_freq,
         control_mode=control_mode,
-        checkpoint_data=checkpoint_data,
+        checkpoint_b64=checkpoint_b64,
         perturbation_tag=perturbation_tag,
     )
     control_tag = control_mode.replace('-', '_')
-    prefix = "ft_" if checkpoint_data is not None else ""
+    prefix = "ft_" if checkpoint_b64 else ""
     suffix = f"_{perturbation_tag}" if perturbation_tag else ""
     exp_name = f"{prefix}sac_{env_id.replace('-', '_')}_{robot_uids}_{control_tag}_seed{seed}_{total_timesteps}steps{suffix}"
     print(f"Spawned function call: {fc.object_id}")

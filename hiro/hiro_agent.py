@@ -1,0 +1,344 @@
+"""
+hiro/hiro_agent.py
+------------------
+The HIROAgent ties the networks (Step 3) and buffers (Step 4) together: action
+selection for both levels, the two SAC updates, and the off-policy correction
+that is HIRO's signature contribution.
+
+Both levels are ordinary SAC agents, so a single private `_sac_update` mirrors
+the upstream ManiSkill SAC math (clipped double-Q targets, entropy-regularized
+actor loss, autotuned temperature, soft target updates).  Worker and manager
+differ only in:
+  - worker  : state = [obs, subgoal],  action = primitive action,  reward = r_lo
+  - manager : state =  obs,            action = subgoal,            reward = sum env reward
+and in the manager's case the stored action (subgoal) is first relabeled by the
+off-policy correction.
+
+Off-policy correction (Nachum et al. 2018)
+------------------------------------------
+A stored high-level transition (s0, g0, R, s_c) was produced under an *old*
+worker policy.  We relabel g0 with the candidate subgoal g~ that makes the
+actually-taken primitive actions a_0..a_{c-1} most likely under the *current*
+worker policy.  Candidates: the original g0, the achieved displacement
+proj(s_c) - proj(s0), and (K-2) Gaussian samples around that displacement.  For
+a candidate g~, the induced subgoal at intermediate step i follows the fixed
+goal-transition telescoping g~_i = proj(s0) + g~ - proj(s_i); we score
+sum_i log pi_worker(a_i | s_i, g~_i), mask steps past the segment length, and
+pick the arg-max candidate.  Only the critic's input action is relabeled; the
+manager actor update samples fresh subgoals as usual.
+"""
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn.functional as F
+
+from hiro.networks import HIRONetworks, TwinCritic, build_hiro_networks
+from hiro.replay_buffer import HighLevelSample, LowLevelSample
+from hiro.subgoal_space import SubgoalSpace
+
+
+@dataclass
+class HIROConfig:
+    action_dim: int
+    c: int = 10
+    subgoal_scale: float = 0.15         # |displacement| bound; scalar or per-dim
+    action_low: float = -1.0
+    action_high: float = 1.0
+    gamma_low: float = 0.95
+    gamma_high: float = 0.8             # bounded manager value (avoids Q divergence)
+    tau: float = 0.005                  # soft target update rate
+    max_grad_norm: float = 10.0         # critic/actor grad clip; 0 disables
+    policy_lr: float = 3e-4
+    q_lr: float = 3e-4
+    alpha_lr: float = 3e-4
+    num_candidates: int = 10            # off-policy-correction candidates (incl. original + achieved)
+    candidate_std_scale: float = 0.5    # Gaussian std = scale * subgoal_scale
+    use_off_policy_correction: bool = True  # debug switch: False => manager trains on raw g0
+    hidden_dim: int = 256
+    n_hidden: int = 3
+    device: str = "cpu"
+
+
+class _LevelOptims:
+    """Optimizers + autotuned temperature for one SAC level."""
+
+    def __init__(self, actor, critic, log_alpha, policy_lr, q_lr, alpha_lr, target_entropy):
+        self.actor = torch.optim.Adam(actor.parameters(), lr=policy_lr)
+        self.critic = torch.optim.Adam(critic.parameters(), lr=q_lr)
+        self.log_alpha = log_alpha
+        self.alpha = torch.optim.Adam([log_alpha], lr=alpha_lr)
+        self.target_entropy = target_entropy
+
+
+class HIROAgent:
+    def __init__(self, subgoal_space: SubgoalSpace, cfg: HIROConfig):
+        self.sp = subgoal_space
+        self.cfg = cfg
+        self.device = torch.device(cfg.device)
+        self.c = cfg.c
+        self.num_candidates = cfg.num_candidates
+
+        obs_dim = subgoal_space.obs_dim
+        sg_dim = subgoal_space.dim
+        act_dim = cfg.action_dim
+
+        # --- networks (online) ---
+        self.nets: HIRONetworks = build_hiro_networks(
+            obs_dim=obs_dim, subgoal_dim=sg_dim, action_dim=act_dim,
+            action_low=cfg.action_low, action_high=cfg.action_high,
+            subgoal_scale=cfg.subgoal_scale,
+            hidden_dim=cfg.hidden_dim, n_hidden=cfg.n_hidden,
+        ).to(self.device)
+
+        # --- target critics (frozen copies) ---
+        self.worker_critic_target = self._make_target(self.nets.worker_critic)
+        self.manager_critic_target = self._make_target(self.nets.manager_critic)
+
+        # --- autotuned temperatures (one log_alpha per level) ---
+        self.log_alpha_low = torch.zeros(1, requires_grad=True, device=self.device)
+        self.log_alpha_high = torch.zeros(1, requires_grad=True, device=self.device)
+
+        # Scale-corrected target entropy. The standard -dim heuristic assumes
+        # actions in [-1, 1]; a tanh policy squashed to [-s, s] has its log-prob
+        # shifted by -sum(log s) per the change-of-variables term, so the entropy
+        # target must absorb +sum(log s) or the autotuned temperature blows up.
+        # (Worker action_scale ~= 1 -> no change; manager scale << 1 -> big shift.)
+        te_low = -float(act_dim) + self.nets.worker_actor.action_scale.log().sum().item()
+        te_high = -float(sg_dim) + self.nets.manager_actor.action_scale.log().sum().item()
+        self.low = _LevelOptims(
+            self.nets.worker_actor, self.nets.worker_critic, self.log_alpha_low,
+            cfg.policy_lr, cfg.q_lr, cfg.alpha_lr, target_entropy=te_low,
+        )
+        self.high = _LevelOptims(
+            self.nets.manager_actor, self.nets.manager_critic, self.log_alpha_high,
+            cfg.policy_lr, cfg.q_lr, cfg.alpha_lr, target_entropy=te_high,
+        )
+
+        # --- subgoal bounds / candidate noise (per-dim tensors on device) ---
+        scale = torch.as_tensor(cfg.subgoal_scale, dtype=torch.float32, device=self.device)
+        if scale.ndim == 0:
+            scale = scale.expand(sg_dim).clone()
+        self.scale = scale                                   # (sg_dim,)
+        self.candidate_std = cfg.candidate_std_scale * scale  # (sg_dim,)
+
+    # ------------------------------------------------------------------
+    # setup helpers
+    # ------------------------------------------------------------------
+
+    def _make_target(self, critic: TwinCritic) -> TwinCritic:
+        target = copy.deepcopy(critic)
+        for p in target.parameters():
+            p.requires_grad_(False)
+        return target.to(self.device)
+
+    def _soft_update(self, online: torch.nn.Module, target: torch.nn.Module) -> None:
+        tau = self.cfg.tau
+        with torch.no_grad():
+            for p, tp in zip(online.parameters(), target.parameters()):
+                tp.data.mul_(1 - tau).add_(tau * p.data)
+
+    # ------------------------------------------------------------------
+    # subgoal-space delegates (so the trainer can call through the agent)
+    # ------------------------------------------------------------------
+
+    def subgoal_transition(self, s, g, s_next):
+        return self.sp.subgoal_transition(s, g, s_next)
+
+    def intrinsic_reward(self, s, g, s_next):
+        return self.sp.intrinsic_reward(s, g, s_next)
+
+    # ------------------------------------------------------------------
+    # action selection
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def select_action(self, obs, subgoal, deterministic: bool = False):
+        """Worker primitive action from (obs, subgoal)."""
+        state = torch.cat([obs, subgoal], dim=-1)
+        if deterministic:
+            return self.nets.worker_actor.get_eval_action(state)
+        action, _, _ = self.nets.worker_actor.get_action(state)
+        return action
+
+    @torch.no_grad()
+    def select_subgoal(self, obs, deterministic: bool = False):
+        """Manager subgoal from obs."""
+        if deterministic:
+            return self.nets.manager_actor.get_eval_action(obs)
+        subgoal, _, _ = self.nets.manager_actor.get_action(obs)
+        return subgoal
+
+    # ------------------------------------------------------------------
+    # off-policy correction
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def off_policy_correct(self, batch: HighLevelSample) -> torch.Tensor:
+        """Return relabeled subgoals g~ of shape (B, subgoal_dim)."""
+        sp = self.sp
+        s0, s_c = batch.s0, batch.s_c
+        inter_obs, inter_act, inter_len = batch.inter_obs, batch.inter_act, batch.inter_len
+        B, c, obs_dim = inter_obs.shape
+        act_dim = inter_act.shape[-1]
+        K = self.num_candidates
+        sg_dim = sp.dim
+
+        proj_s0 = sp.project(s0)                  # (B, sg)
+        proj_sc = sp.project(s_c)                 # (B, sg)
+        diff = proj_sc - proj_s0                  # achieved displacement (B, sg)
+
+        # Candidate subgoals: original, achieved, then Gaussian around achieved.
+        cands = torch.empty(B, K, sg_dim, device=s0.device)
+        cands[:, 0] = batch.g0
+        cands[:, 1] = diff
+        if K > 2:
+            noise = torch.randn(B, K - 2, sg_dim, device=s0.device) * self.candidate_std
+            cands[:, 2:] = diff.unsqueeze(1) + noise
+        # Clip to the manager's subgoal range [-scale, scale] (per-dim).
+        cands = torch.minimum(cands, self.scale)
+        cands = torch.maximum(cands, -self.scale)
+
+        # Induced subgoal at each intermediate step for each candidate:
+        #   g~_{i,k} = proj(s0) + g~_k - proj(s_i)
+        proj_inter = sp.project(inter_obs)        # (B, c, sg)
+        induced = (
+            proj_s0[:, None, None, :]
+            + cands[:, :, None, :]
+            - proj_inter[:, None, :, :]
+        )                                          # (B, K, c, sg)
+
+        obs_exp = inter_obs[:, None, :, :].expand(B, K, c, obs_dim)   # (B,K,c,obs)
+        state = torch.cat([obs_exp, induced], dim=-1)                 # (B,K,c,obs+sg)
+        act_exp = inter_act[:, None, :, :].expand(B, K, c, act_dim)   # (B,K,c,act)
+
+        logp = self.nets.worker_actor.action_log_prob(
+            state.reshape(B * K * c, obs_dim + sg_dim),
+            act_exp.reshape(B * K * c, act_dim),
+        ).reshape(B, K, c)                                            # (B,K,c)
+
+        # Mask steps at or beyond the (possibly early-terminated) segment length.
+        step_ids = torch.arange(c, device=s0.device)[None, :]        # (1,c)
+        valid = (step_ids < inter_len[:, None]).float()              # (B,c)
+        score = (logp * valid[:, None, :]).sum(dim=-1)               # (B,K)
+
+        best = score.argmax(dim=1)                                   # (B,)
+        return cands[torch.arange(B, device=s0.device), best]       # (B, sg)
+
+    # ------------------------------------------------------------------
+    # SAC updates
+    # ------------------------------------------------------------------
+
+    def _sac_update(self, *, actor, critic, critic_target, optims: _LevelOptims,
+                    gamma: float, state, action, reward, next_state, done) -> dict:
+        """One SAC gradient step for a single level. Shapes: reward/done (B,)."""
+        alpha = optims.log_alpha.exp().item()
+        reward = reward.unsqueeze(-1)               # (B,1)
+        done = done.float().unsqueeze(-1)           # (B,1)
+
+        # --- critic ---
+        with torch.no_grad():
+            next_action, next_logpi, _ = actor.get_action(next_state)
+            q1_t, q2_t = critic_target(next_state, next_action)
+            min_q_next = torch.min(q1_t, q2_t) - alpha * next_logpi   # (B,1)
+            target_q = reward + (1.0 - done) * gamma * min_q_next     # (B,1)
+        q1, q2 = critic(state, action)
+        q_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+        optims.critic.zero_grad()
+        q_loss.backward()
+        if self.cfg.max_grad_norm:
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), self.cfg.max_grad_norm)
+        optims.critic.step()
+
+        # --- actor ---
+        pi, logpi, _ = actor.get_action(state)
+        q1_pi, q2_pi = critic(state, pi)
+        min_q_pi = torch.min(q1_pi, q2_pi)
+        actor_loss = (alpha * logpi - min_q_pi).mean()
+        optims.actor.zero_grad()
+        actor_loss.backward()
+        if self.cfg.max_grad_norm:
+            torch.nn.utils.clip_grad_norm_(actor.parameters(), self.cfg.max_grad_norm)
+        optims.actor.step()
+
+        # --- temperature (autotune) ---
+        with torch.no_grad():
+            _, logpi_detached, _ = actor.get_action(state)
+        alpha_loss = (-optims.log_alpha.exp() * (logpi_detached + optims.target_entropy)).mean()
+        optims.alpha.zero_grad()
+        alpha_loss.backward()
+        optims.alpha.step()
+
+        # --- soft target update ---
+        self._soft_update(critic, critic_target)
+
+        return {
+            "q_loss": q_loss.item(),
+            "actor_loss": actor_loss.item(),
+            "alpha_loss": alpha_loss.item(),
+            "alpha": optims.log_alpha.exp().item(),
+        }
+
+    def update_low(self, batch: LowLevelSample) -> dict:
+        """SAC update for the worker. State = [obs, subgoal]."""
+        state = torch.cat([batch.obs, batch.subgoal], dim=-1)
+        next_state = torch.cat([batch.next_obs, batch.next_subgoal], dim=-1)
+        return self._sac_update(
+            actor=self.nets.worker_actor,
+            critic=self.nets.worker_critic,
+            critic_target=self.worker_critic_target,
+            optims=self.low,
+            gamma=self.cfg.gamma_low,
+            state=state, action=batch.action, reward=batch.reward,
+            next_state=next_state, done=batch.done,
+        )
+
+    def update_high(self, batch: HighLevelSample) -> dict:
+        """SAC update for the manager, after off-policy relabeling of the action.
+
+        With cfg.use_off_policy_correction=False the manager trains on the raw
+        stored subgoal g0 — a debugging knob to isolate whether the correction
+        helps or hurts.
+        """
+        if self.cfg.use_off_policy_correction:
+            action = self.off_policy_correct(batch)
+        else:
+            action = batch.g0
+        return self._sac_update(
+            actor=self.nets.manager_actor,
+            critic=self.nets.manager_critic,
+            critic_target=self.manager_critic_target,
+            optims=self.high,
+            gamma=self.cfg.gamma_high,
+            state=batch.s0, action=action, reward=batch.reward_sum,
+            next_state=batch.s_c, done=batch.done,
+        )
+
+    # ------------------------------------------------------------------
+    # checkpointing
+    # ------------------------------------------------------------------
+
+    def state_dict(self) -> dict:
+        return {
+            "worker_actor": self.nets.worker_actor.state_dict(),
+            "worker_critic": self.nets.worker_critic.state_dict(),
+            "worker_critic_target": self.worker_critic_target.state_dict(),
+            "manager_actor": self.nets.manager_actor.state_dict(),
+            "manager_critic": self.nets.manager_critic.state_dict(),
+            "manager_critic_target": self.manager_critic_target.state_dict(),
+            "log_alpha_low": self.log_alpha_low.detach(),
+            "log_alpha_high": self.log_alpha_high.detach(),
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        self.nets.worker_actor.load_state_dict(sd["worker_actor"])
+        self.nets.worker_critic.load_state_dict(sd["worker_critic"])
+        self.worker_critic_target.load_state_dict(sd["worker_critic_target"])
+        self.nets.manager_actor.load_state_dict(sd["manager_actor"])
+        self.nets.manager_critic.load_state_dict(sd["manager_critic"])
+        self.manager_critic_target.load_state_dict(sd["manager_critic_target"])
+        with torch.no_grad():
+            self.log_alpha_low.copy_(sd["log_alpha_low"].to(self.device))
+            self.log_alpha_high.copy_(sd["log_alpha_high"].to(self.device))

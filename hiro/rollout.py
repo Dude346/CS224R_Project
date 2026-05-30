@@ -90,47 +90,62 @@ class HierarchicalRollout:
         ar = torch.arange(E, device=self.device)
         episode_end = episode_end.bool()
 
-        # 1-3: low-level (worker) transition uses the CURRENT subgoal.
-        r_lo = self.agent.intrinsic_reward(obs, self.cur_subgoal, real_next_obs)
+        # 1: worker reward + telescoped subgoal, both using the CURRENT subgoal.
+        #    worker_reward is phase-aware (grasp-gated) when a detector is set.
+        r_lo = self.agent.worker_reward(obs, self.cur_subgoal, real_next_obs)
         g_next = self.agent.subgoal_transition(obs, self.cur_subgoal, real_next_obs)
-        self.low.add(obs, self.cur_subgoal, action, r_lo, real_next_obs, g_next, bootstrap_done)
 
-        # 4: record the intermediate (s_i, a_i) at the current segment position.
+        # 2: record the intermediate (s_i, a_i) at the current segment position.
         #    seg_len is in [0, c-1] here (it is reset to 0 on flush below), so this
         #    never writes out of bounds.
         self.seg_obs[ar, self.seg_len] = obs
         self.seg_act[ar, self.seg_len] = action
 
-        # 5: accumulate reward, advance segment counter.
+        # 3: accumulate reward, advance segment counter.
         self.seg_reward = self.seg_reward + r_env
         self.seg_len = self.seg_len + 1
 
-        # 6: a segment ends when it reaches length c OR the episode ended.
+        # 4: a segment ends when it reaches length c OR the episode ended.
         flush = (self.seg_len >= c) | episode_end
+        idx = flush.nonzero(as_tuple=True)[0]
 
-        # 7: flush completed segments to the high-level buffer (BEFORE resetting them).
-        if flush.any():
-            idx = flush.nonzero(as_tuple=True)[0]
+        # 5: flush completed segments to the high-level buffer (BEFORE resetting them).
+        #    The manager's done is the TRUE episode end (a c-boundary mid-episode is
+        #    NOT terminal for the manager — it has a successor segment to bootstrap).
+        if idx.numel() > 0:
             self.high.add_batch(
                 self.seg_start_obs[idx],
                 self.seg_subgoal[idx],
                 self.seg_reward[idx],
                 real_next_obs[idx],          # s_c = terminal obs of the segment
-                bootstrap_done[idx],
+                episode_end[idx].float(),    # F3: manager done = real episode end
                 self.seg_obs[idx],
                 self.seg_act[idx],
                 self.seg_len[idx],
             )
 
-        # 8: default subgoal update is the telescoped transition...
-        self.cur_subgoal = g_next
-        # ...but flushed envs get a fresh subgoal sampled from the next segment's start.
-        if flush.any():
+        # 6: decide the worker's NEXT subgoal. Within a segment it is the telescoped
+        #    g_next; at a flush it is a FRESHLY SAMPLED manager subgoal — which is the
+        #    goal the worker will actually act under next step, so it must be what the
+        #    worker bootstraps from (F2). Sampling happens before low.add so the stored
+        #    transition carries the correct next_subgoal.
+        worker_next_subgoal = g_next.clone()
+        new_cur = g_next.clone()
+        if idx.numel() > 0:
             new_g = self.agent.select_subgoal(resample_obs[idx])
-            self.cur_subgoal[idx] = new_g
+            worker_next_subgoal[idx] = new_g
+            new_cur[idx] = new_g
+
+        # 7: store the worker transition with the corrected next subgoal.
+        self.low.add(obs, self.cur_subgoal, action, r_lo, real_next_obs,
+                     worker_next_subgoal, bootstrap_done)
+
+        # 8: commit segment-state resets for flushed envs and advance cur_subgoal.
+        if idx.numel() > 0:
             self.seg_subgoal[idx] = new_g
             self.seg_start_obs[idx] = resample_obs[idx]
             self.seg_reward[idx] = 0.0
             self.seg_len[idx] = 0
+        self.cur_subgoal = new_cur
 
         return self.cur_subgoal

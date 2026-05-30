@@ -57,6 +57,8 @@ class HIROConfig:
     num_candidates: int = 10            # off-policy-correction candidates (incl. original + achieved)
     candidate_std_scale: float = 0.5    # Gaussian std = scale * subgoal_scale
     use_off_policy_correction: bool = True  # debug switch: False => manager trains on raw g0
+    use_phased_reward: bool = True      # grasp-gate the object subgoal dims in the worker reward
+    grasp_bonus: float = 0.1            # one-time worker bonus on the step a grasp is acquired
     hidden_dim: int = 256
     n_hidden: int = 3
     device: str = "cpu"
@@ -124,6 +126,11 @@ class HIROAgent:
         self.scale = scale                                   # (sg_dim,)
         self.candidate_std = cfg.candidate_std_scale * scale  # (sg_dim,)
 
+        # Optional grasp detector (set by the trainer from the env id). When present
+        # AND the subgoal space has object dims, the worker uses the phase-aware
+        # reward; otherwise it falls back to the plain intrinsic reward.
+        self.grasp_detector = None
+
     # ------------------------------------------------------------------
     # setup helpers
     # ------------------------------------------------------------------
@@ -149,6 +156,24 @@ class HIROAgent:
 
     def intrinsic_reward(self, s, g, s_next):
         return self.sp.intrinsic_reward(s, g, s_next)
+
+    @torch.no_grad()
+    def worker_reward(self, s, g, s_next):
+        """Worker reward used during rollout. Phase-aware (grasp-gated object dims)
+        when a grasp detector is set and the subgoal space defines object dims;
+        otherwise the plain intrinsic reward (-||residual||)."""
+        if (
+            not self.cfg.use_phased_reward
+            or self.grasp_detector is None
+            or not self.sp.object_positions
+        ):
+            return self.sp.intrinsic_reward(s, g, s_next)
+        is_grasped = self.grasp_detector(s_next)            # graspable/controlled now?
+        was_grasped = self.grasp_detector(s)
+        just_grasped = is_grasped & (~was_grasped)          # flips False -> True this step
+        return self.sp.phased_intrinsic_reward(
+            s, g, s_next, is_grasped, just_grasped, self.cfg.grasp_bonus
+        )
 
     # ------------------------------------------------------------------
     # action selection

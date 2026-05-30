@@ -29,7 +29,7 @@ import torch
 from hiro.hiro_agent import HIROAgent, HIROConfig
 from hiro.replay_buffer import HighLevelBuffer, LowLevelBuffer
 from hiro.rollout import HierarchicalRollout
-from hiro.subgoal_space import get_subgoal_space
+from hiro.subgoal_space import get_grasp_detector, get_subgoal_space
 
 
 @dataclass
@@ -55,6 +55,8 @@ class TrainArgs:
     gamma_low: float = 0.95
     gamma_high: float = 0.8
     tau: float = 0.005
+    use_phased_reward: bool = True
+    grasp_bonus: float = 0.1
     policy_lr: float = 3e-4
     q_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -121,7 +123,7 @@ def evaluate(agent: HIROAgent, eval_envs, args: TrainArgs) -> dict:
     c = args.c
     device = agent.device
 
-    obs, _ = eval_envs.reset()
+    obs, _ = eval_envs.reset(seed=args.seed)  # fixed seed => reproducible eval episodes
     cur_g = agent.select_subgoal(obs, deterministic=True)
     steps_since = torch.zeros(E, dtype=torch.long, device=device)
 
@@ -185,9 +187,14 @@ def train(args: TrainArgs) -> str:
         policy_lr=args.policy_lr, q_lr=args.q_lr, alpha_lr=args.alpha_lr,
         num_candidates=args.num_candidates,
         use_off_policy_correction=args.use_off_policy_correction,
+        use_phased_reward=args.use_phased_reward, grasp_bonus=args.grasp_bonus,
         device=args.device,
     )
     agent = HIROAgent(sp, cfg)
+    if args.use_phased_reward:
+        agent.grasp_detector = get_grasp_detector(args.env_id)
+        print(f"phased worker reward: detector={'set' if agent.grasp_detector else 'NONE'} "
+              f"| object_dims={sp.object_positions} | grasp_bonus={args.grasp_bonus}")
 
     low_buf = LowLevelBuffer(args.low_buffer_size, args.num_envs, obs_dim, sp.dim, act_dim,
                              storage_device=args.buffer_device, sample_device=args.device)
@@ -246,13 +253,20 @@ def train(args: TrainArgs) -> str:
             obs = next_obs
             global_step += args.num_envs
 
-            # train-side episode metrics (env reward the policy actually collects)
+            # train-side episode metrics (env reward the policy actually collects).
+            # Logged to BOTH TensorBoard and W&B so the dashboard mirrors the SAC
+            # pipeline (eval/* AND train/* curves).
             if "final_info" in infos:
                 ep = infos["final_info"]["episode"]
                 m = infos["_final_info"]
-                for k in ("return", "success_once", "reward"):
-                    if k in ep:
-                        writer.add_scalar(f"train/{k}", ep[k][m].float().mean().item(), global_step)
+                train_log = {}
+                for k, v in ep.items():
+                    train_log[f"train/{k}"] = v[m].float().mean().item()
+                for tag, val in train_log.items():
+                    writer.add_scalar(tag, val, global_step)
+                if args.track:
+                    import wandb
+                    wandb.log(train_log, step=global_step)
 
         # ---- updates ----
         if global_step >= args.learning_starts:
@@ -275,6 +289,10 @@ def train(args: TrainArgs) -> str:
                 writer.add_scalar("data/mean_subgoal_norm", ls.subgoal.norm(dim=-1).mean().item(), global_step)
                 writer.add_scalar("data/low_buffer", len(low_buf), global_step)
                 writer.add_scalar("data/high_buffer", len(high_buf), global_step)
+                # grasp rate: is the worker actually grasping? (key signal for the phased reward)
+                if agent.grasp_detector is not None:
+                    grasp_rate = agent.grasp_detector(ls.next_obs).float().mean().item()
+                    writer.add_scalar("data/grasp_rate", grasp_rate, global_step)
                 if len(high_buf) > 0:
                     hs = high_buf.sample(min(args.batch_size, len(high_buf)))
                     writer.add_scalar("data/mean_manager_reward", hs.reward_sum.mean().item(), global_step)

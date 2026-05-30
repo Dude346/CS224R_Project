@@ -19,6 +19,8 @@ import pytest
 import torch
 
 from hiro.subgoal_space import (
+    GRASP_DETECTORS,
+    GraspDetector,
     HIRO_SUBGOAL_SPACES,
     SubgoalSpace,
     get_subgoal_space,
@@ -223,3 +225,93 @@ class TestIntrinsicReward:
         r = sp.intrinsic_reward(s, g, s_next)
         assert r.shape == (16,)
         assert (r <= 0).all()
+
+
+# ---------------------------------------------------------------------------
+# Phase-aware worker reward
+# Subgoal dim 4: hand = dims [0,1], object = dims [2,3] (grasp-gated).
+# s=0, g=[1,0,0,1], proj(s')=[0.5,0,0,0]  ->  residual=[0.5,0,0,1]
+#   hand_term = -||[0.5,0]|| = -0.5
+#   cube_term = -||[0,1]||   = -1.0
+# ---------------------------------------------------------------------------
+
+class TestPhasedReward:
+    @pytest.fixture
+    def psp(self) -> SubgoalSpace:
+        return SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=4, object_dims=(2, 3))
+
+    @staticmethod
+    def _case():
+        s      = torch.zeros(4)
+        g      = torch.tensor([1.0, 0.0, 0.0, 1.0])
+        s_next = torch.tensor([0.5, 0.0, 0.0, 0.0])
+        return s, g, s_next
+
+    def test_partition(self, psp):
+        assert psp.hand_positions == [0, 1]
+        assert psp.object_positions == [2, 3]
+
+    def test_pregrasp_ignores_object_term(self, psp):
+        s, g, sn = self._case()
+        r = psp.phased_intrinsic_reward(s, g, sn, torch.tensor(0.0), torch.tensor(0.0), grasp_bonus=0.3)
+        assert torch.allclose(r, torch.tensor(-0.5))           # hand only; cube term dropped
+
+    def test_sustained_grasp_adds_object_term(self, psp):
+        s, g, sn = self._case()
+        r = psp.phased_intrinsic_reward(s, g, sn, torch.tensor(1.0), torch.tensor(0.0), grasp_bonus=0.3)
+        assert torch.allclose(r, torch.tensor(-1.5))           # hand + cube, no bonus
+
+    def test_grasp_step_adds_object_and_bonus(self, psp):
+        s, g, sn = self._case()
+        r = psp.phased_intrinsic_reward(s, g, sn, torch.tensor(1.0), torch.tensor(1.0), grasp_bonus=0.3)
+        assert torch.allclose(r, torch.tensor(-1.2))           # hand + cube + bonus (-1.5 + 0.3)
+
+    def test_batched_gating(self, psp):
+        s = torch.zeros(4, 4)
+        g = torch.zeros(4, 4); g[:, 0] = 1.0; g[:, 3] = 1.0
+        sn = torch.zeros(4, 4); sn[:, 0] = 0.5
+        is_grasped = torch.tensor([0.0, 1.0, 0.0, 1.0])
+        just = torch.tensor([0.0, 0.0, 0.0, 1.0])
+        r = psp.phased_intrinsic_reward(s, g, sn, is_grasped, just, grasp_bonus=0.3)
+        assert r.shape == (4,)
+        assert torch.allclose(r, torch.tensor([-0.5, -1.5, -0.5, -1.2]))
+
+    def test_canonical_pickcube_partition(self):
+        sp = HIRO_SUBGOAL_SPACES["PickCube-v1"]
+        assert sp.hand_positions == [0, 1, 2]      # tcp_xyz always active
+        assert sp.object_positions == [3, 4, 5]    # cube_xyz grasp-gated
+
+    def test_empty_object_dims_equals_plain(self):
+        # With no object dims, phased reward (grasped or not) == plain -||residual||.
+        sp = SubgoalSpace(indices=[1, 3, 5], obs_dim=6)  # object_dims default ()
+        s = torch.randn(6); g = torch.randn(3); sn = torch.randn(6)
+        plain = sp.intrinsic_reward(s, g, sn)
+        phased = sp.phased_intrinsic_reward(s, g, sn, torch.tensor(1.0), torch.tensor(0.0))
+        assert torch.allclose(plain, phased)
+
+
+# ---------------------------------------------------------------------------
+# Embodiment-independent grasp detector
+# ---------------------------------------------------------------------------
+
+class TestGraspDetector:
+    def test_pickcube_detects_near_and_lifted(self):
+        det = GRASP_DETECTORS["PickCube-v1"]
+        obs = torch.zeros(3, 42)
+        # env0: gripper at cube AND cube lifted -> grasped
+        obs[0, 36:39] = torch.tensor([0.01, 0.0, 0.0]); obs[0, 31] = 0.10
+        # env1: gripper at cube but cube on the table (not lifted) -> not grasped
+        obs[1, 36:39] = torch.tensor([0.01, 0.0, 0.0]); obs[1, 31] = 0.02
+        # env2: cube lifted but gripper far away -> not grasped
+        obs[2, 36:39] = torch.tensor([0.30, 0.0, 0.0]); obs[2, 31] = 0.10
+        g = det(obs)
+        assert bool(g[0]) is True
+        assert bool(g[1]) is False
+        assert bool(g[2]) is False
+
+    def test_detector_is_force_free(self):
+        # Detector reads only positions, so identical obs -> identical result
+        # regardless of any (absent) force fields => same across embodiments.
+        det = GraspDetector(tcp_to_obj_indices=(0, 1, 2), obj_z_index=3, near_threshold=0.05, lift_threshold=0.035)
+        obs = torch.tensor([[0.0, 0.0, 0.0, 0.10]])   # at object, lifted
+        assert bool(det(obs)[0]) is True

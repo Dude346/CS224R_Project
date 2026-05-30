@@ -54,6 +54,10 @@ class SubgoalSpace:
     indices: list[int]
     obs_dim: int
     label: str = ""
+    # Positions WITHIN the subgoal vector (0..dim-1) that are object/offset dims
+    # the worker can only affect AFTER it has grasped the object. Empty => every dim
+    # is always active (plain HIRO behaviour used by the original tests).
+    object_dims: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.indices:
@@ -65,6 +69,13 @@ class SubgoalSpace:
             raise ValueError(
                 f"indices {bad} out of range for obs_dim={self.obs_dim}"
             )
+        dim = len(self.indices)
+        bad_obj = [d for d in self.object_dims if not (0 <= d < dim)]
+        if bad_obj:
+            raise ValueError(f"object_dims {bad_obj} out of range for subgoal dim={dim}")
+        obj = set(self.object_dims)
+        self.object_positions = list(self.object_dims)            # grasp-gated dims
+        self.hand_positions = [i for i in range(dim) if i not in obj]  # always-active dims
 
     @property
     def dim(self) -> int:
@@ -113,6 +124,38 @@ class SubgoalSpace:
         residual = self.subgoal_transition(s, g, s_next)
         return -torch.norm(residual, dim=-1)
 
+    def phased_intrinsic_reward(
+        self,
+        s: torch.Tensor,             # (..., obs_dim)
+        g: torch.Tensor,             # (..., subgoal_dim)
+        s_next: torch.Tensor,        # (..., obs_dim)
+        is_grasped: torch.Tensor,    # (...,) 1 if the object is currently grasped/controllable
+        just_grasped: torch.Tensor,  # (...,) 1 on the step is_grasped flips False -> True
+        grasp_bonus: float = 0.0,
+    ) -> torch.Tensor:               # (...,)
+        """Phase-aware worker reward (identical structure for HIRO & object-centric).
+
+        Pre-grasp the object dims are physically unreachable, so they are dropped:
+            r = -||residual_hand||
+        Once grasped, the object term is added, plus a one-time bonus on the step
+        the grasp is acquired:
+            r = -||residual_hand|| - ||residual_object|| + grasp_bonus * just_grasped
+
+        `hand_positions` / `object_positions` are positions within the subgoal
+        vector; only `indices` differ between HIRO (absolute positions) and
+        object-centric (relative offsets). The env reward is NOT touched — this is
+        only the low-level/worker reward.
+        """
+        residual = self.subgoal_transition(s, g, s_next)          # (..., dim)
+        hand_term = -torch.norm(residual[..., self.hand_positions], dim=-1)
+        if self.object_positions:
+            cube_term = -torch.norm(residual[..., self.object_positions], dim=-1)
+        else:
+            cube_term = torch.zeros_like(hand_term)
+        ig = is_grasped.to(hand_term.dtype)
+        jg = just_grasped.to(hand_term.dtype)
+        return hand_term + ig * cube_term + jg * grasp_bonus
+
     def __repr__(self) -> str:
         tag = f" ({self.label})" if self.label else ""
         return f"SubgoalSpace(dim={self.dim}, obs_dim={self.obs_dim}{tag})"
@@ -146,19 +189,54 @@ class SubgoalSpace:
 
 HIRO_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
     "PickCube-v1": SubgoalSpace(
-        indices=[19, 20, 21,   # tcp_xyz  : extra.tcp_pose[:3]  starts at obs[19]
-                 29, 30, 31],  # cube_xyz : extra.obj_pose[:3]  starts at obs[29]
+        indices=[19, 20, 21,   # tcp_xyz  : extra.tcp_pose[:3]  starts at obs[19]  (HAND)
+                 29, 30, 31],  # cube_xyz : extra.obj_pose[:3]  starts at obs[29]  (OBJECT)
         obs_dim=42,
         label="tcp_xyz+cube_xyz",
+        object_dims=(3, 4, 5),  # cube dims are grasp-gated (worker can't move cube pre-grasp)
     ),
     "StackCube-v1": SubgoalSpace(
-        indices=[18, 19, 20,   # tcp_xyz   : extra.tcp_pose[:3]   starts at obs[18]
-                 25, 26, 27,   # cubeA_xyz : extra.cubeA_pose[:3] starts at obs[25]
+        indices=[18, 19, 20,   # tcp_xyz   : extra.tcp_pose[:3]   starts at obs[18]  (HAND)
+                 25, 26, 27,   # cubeA_xyz : extra.cubeA_pose[:3] starts at obs[25]  (OBJECT)
                  32, 33, 34],  # cubeB_xyz : extra.cubeB_pose[:3] starts at obs[32]
         obs_dim=48,
         label="tcp_xyz+cubeA_xyz+cubeB_xyz",
+        object_dims=(3, 4, 5),  # cubeA is the grasped object; cubeB (6,7,8) is the static target (TODO: revisit)
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Embodiment-independent grasp detector.
+# Uses POSITIONS only (gripper->object vector + object height), never contact
+# forces, so the SAME fixed thresholds apply to every embodiment (stock or
+# weakened gripper). is_grasped := object is close to the gripper AND lifted off
+# the table — a strong, force-free "the object is under control" signal.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GraspDetector:
+    tcp_to_obj_indices: tuple[int, int, int]  # obs indices of the gripper->object vector
+    obj_z_index: int                          # obs index of the object's height (z)
+    near_threshold: float = 0.05              # gripper within 5 cm of the object
+    lift_threshold: float = 0.035             # object center lifted above the table rest height
+
+    def __call__(self, obs: torch.Tensor) -> torch.Tensor:
+        dist = torch.norm(obs[..., list(self.tcp_to_obj_indices)], dim=-1)
+        z = obs[..., self.obj_z_index]
+        return (dist < self.near_threshold) & (z > self.lift_threshold)
+
+
+GRASP_DETECTORS: dict[str, GraspDetector] = {
+    # PickCube: tcp_to_obj = obs[36:39]; cube_z = obs[31].
+    "PickCube-v1": GraspDetector(tcp_to_obj_indices=(36, 37, 38), obj_z_index=31),
+    # StackCube: tcp_to_cubeA = obs[39:42]; cubeA_z = obs[27].
+    "StackCube-v1": GraspDetector(tcp_to_obj_indices=(39, 40, 41), obj_z_index=27),
+}
+
+
+def get_grasp_detector(env_id: str) -> "GraspDetector | None":
+    return GRASP_DETECTORS.get(env_id)
 
 
 def get_subgoal_space(env_id: str) -> SubgoalSpace:

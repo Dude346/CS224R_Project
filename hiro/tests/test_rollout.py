@@ -223,3 +223,42 @@ class TestRewardAccumulation:
                         torch.zeros(E, dtype=torch.bool), torch.zeros(E))
             obs = nxt
         assert torch.allclose(high.reward_sum[1], torch.tensor(11.0))
+
+
+# ---------------------------------------------------------------------------
+# Boundary-transition correctness (the two audit fixes)
+# ---------------------------------------------------------------------------
+
+class TestBoundaryFixes:
+    def _step(self, roll, E, episode_end=False):
+        obs = torch.randn(E, OBS)
+        nxt = torch.randn(E, OBS)
+        return roll.record(
+            obs, torch.zeros(E, ACT), nxt, nxt, torch.zeros(E),
+            torch.tensor([episode_end] * E), torch.zeros(E),
+        )
+
+    def test_worker_next_subgoal_at_boundary_is_fresh_goal(self):
+        # F2: at a c-boundary the worker's stored next_subgoal must be the freshly
+        # sampled manager goal (what it will act under), not the telescoped g_next.
+        E, c = 1, 2
+        agent, low, high, roll, sp = setup(E, c)
+        roll.start(torch.randn(E, OBS))
+        self._step(roll, E)                 # step 1, no flush
+        new_cur = self._step(roll, E)       # step 2, flush at c=2
+        # the boundary transition is the 2nd low entry (index 1)
+        assert torch.allclose(low.next_subgoal[1, 0], new_cur[0])
+        # and within a segment it is the telescoped goal (1st entry != fresh resample)
+        # (sanity: the 1st transition's next_subgoal is the transition, not a resample)
+        assert low.next_subgoal[0, 0].shape == (SG,)
+
+    def test_manager_done_is_episode_end_only(self):
+        # F3: high-level done is 1 only on a true episode end, 0 on a c-boundary.
+        E, c = 1, 2
+        agent, low, high, roll, sp = setup(E, c)
+        roll.start(torch.randn(E, OBS))
+        self._step(roll, E, episode_end=False)   # step 1
+        self._step(roll, E, episode_end=False)    # step 2 -> c-boundary flush
+        assert high.done[0].item() == 0.0         # mid-episode boundary: not done
+        self._step(roll, E, episode_end=True)     # episode-end flush (seg_len=1)
+        assert high.done[1].item() == 1.0         # real terminal: done

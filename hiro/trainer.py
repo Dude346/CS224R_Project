@@ -41,7 +41,7 @@ class TrainArgs:
     total_timesteps: int = 1_000_000
     num_envs: int = 32
     num_eval_envs: int = 16
-    num_eval_steps: int = 50
+    num_eval_steps: int = 200          # 4 full episodes per eval env (50-step horizon)
     eval_freq: int = 50_000           # in env steps
     learning_starts: int = 4_000
     training_freq: int = 64           # env steps between update phases
@@ -53,14 +53,14 @@ class TrainArgs:
     c: int = 10
     subgoal_scale: float = 0.15
     gamma_low: float = 0.95
-    gamma_high: float = 0.8
+    gamma_high: float = 0.95           # was 0.8; low value made manager too myopic (0.8^4=0.41 at end)
     tau: float = 0.005
     use_phased_reward: bool = True
-    pbrs_alpha: float = 0.5            # PBRS grasp potential strength (replaces grasp_bonus)
+    pbrs_alpha: float = 0.1            # was 0.5; scaled to ~intrinsic reward magnitude (subgoal_scale*sqrt(3)≈0.26)
     # partial_reset=True: episodes end on TRUE termination (env success), not just
     # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
     # success). Flat SAC baselines used False to match upstream.
-    partial_reset: bool = True
+    partial_reset: bool = False
     policy_lr: float = 3e-4
     q_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -257,14 +257,7 @@ def train(args: TrainArgs) -> str:
             next_obs, reward, terminations, truncations, infos = envs.step(action)
             episode_end = (truncations | terminations).bool()
             real_next_obs = next_obs.clone()
-            # bootstrap_done = 1 only on TRUE env terminations (success), so the
-            # worker doesn't extrapolate Q past a real terminal state. Under
-            # ignore_terminations=True (partial_reset=False) the wrapper forces
-            # terminations to all-False, so this is all-zeros == "always bootstrap"
-            # (matches the old behaviour). Under partial_reset=True, this stops
-            # the worker from bootstrapping past success — critical when shaping
-            # rewards (PBRS) charge per-step costs.
-            bootstrap_done = terminations.float()
+            bootstrap_done = torch.zeros(args.num_envs, device=device)
             if "final_info" in infos:
                 need_final = episode_end
                 real_next_obs[need_final] = infos["final_observation"][need_final]

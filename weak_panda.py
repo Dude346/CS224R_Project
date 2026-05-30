@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Any
 
 import gymnasium as gym
+
 import mani_skill.envs  # noqa: F401 - registers ManiSkill envs with gymnasium
 import torch
 from mani_skill.agents.registration import register_agent

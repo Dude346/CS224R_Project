@@ -48,7 +48,7 @@ class HIROConfig:
     action_low: float = -1.0
     action_high: float = 1.0
     gamma_low: float = 0.95
-    gamma_high: float = 0.8             # bounded manager value (avoids Q divergence)
+    gamma_high: float = 0.95            # was 0.8; raised so manager plans across full episode
     tau: float = 0.005                  # soft target update rate
     max_grad_norm: float = 10.0         # critic/actor grad clip; 0 disables
     policy_lr: float = 3e-4
@@ -58,8 +58,8 @@ class HIROConfig:
     candidate_std_scale: float = 0.5    # Gaussian std = scale * subgoal_scale
     use_off_policy_correction: bool = True  # debug switch: False => manager trains on raw g0
     use_phased_reward: bool = True      # grasp-gate the object subgoal dims in the worker reward
-    pbrs_alpha: float = 0.5             # PBRS grasp potential strength (Φ = α·is_grasped);
-                                        # gives +γα at grasp, -α at drop, all policy-invariant
+    pbrs_alpha: float = 0.1             # PBRS grasp potential strength (Φ = α·is_grasped);
+                                        # was 0.5; calibrated to ~intrinsic reward magnitude
     hidden_dim: int = 256
     n_hidden: int = 3
     device: str = "cpu"

@@ -58,7 +58,8 @@ class HIROConfig:
     candidate_std_scale: float = 0.5    # Gaussian std = scale * subgoal_scale
     use_off_policy_correction: bool = True  # debug switch: False => manager trains on raw g0
     use_phased_reward: bool = True      # grasp-gate the object subgoal dims in the worker reward
-    grasp_bonus: float = 0.1            # one-time worker bonus on the step a grasp is acquired
+    pbrs_alpha: float = 0.5             # PBRS grasp potential strength (Φ = α·is_grasped);
+                                        # gives +γα at grasp, -α at drop, all policy-invariant
     hidden_dim: int = 256
     n_hidden: int = 3
     device: str = "cpu"
@@ -159,20 +160,29 @@ class HIROAgent:
 
     @torch.no_grad()
     def worker_reward(self, s, g, s_next):
-        """Worker reward used during rollout. Phase-aware (grasp-gated object dims)
-        when a grasp detector is set and the subgoal space defines object dims;
-        otherwise the plain intrinsic reward (-||residual||)."""
+        """Worker reward used during rollout.
+
+        Phase-aware PBRS form (the v5 design) when a grasp detector is set AND
+        the subgoal space defines object dims AND pbrs_alpha > 0; otherwise the
+        plain intrinsic reward (-||residual||) as a no-shaping fallback.
+
+        The phased reward:
+            r = -||hand_residual||
+              + is_grasped(s) * (-||object_residual||)
+              + γ·α·is_grasped(s') − α·is_grasped(s)        (PBRS, policy-invariant)
+        """
         if (
             not self.cfg.use_phased_reward
             or self.grasp_detector is None
             or not self.sp.object_positions
+            or self.cfg.pbrs_alpha <= 0.0
         ):
             return self.sp.intrinsic_reward(s, g, s_next)
-        is_grasped = self.grasp_detector(s_next)            # graspable/controlled now?
-        was_grasped = self.grasp_detector(s)
-        just_grasped = is_grasped & (~was_grasped)          # flips False -> True this step
-        return self.sp.phased_intrinsic_reward(
-            s, g, s_next, is_grasped, just_grasped, self.cfg.grasp_bonus
+        is_grasped_s = self.grasp_detector(s)
+        is_grasped_s_next = self.grasp_detector(s_next)
+        return self.sp.phased_pbrs_intrinsic_reward(
+            s, g, s_next, is_grasped_s, is_grasped_s_next,
+            gamma=self.cfg.gamma_low, alpha=self.cfg.pbrs_alpha,
         )
 
     # ------------------------------------------------------------------

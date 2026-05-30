@@ -12,7 +12,7 @@ from modal_train_sac import image, volume
 
 app = modal.App("inspect-hiro-run")
 
-DEFAULT_RUN = "hiro_pickcube_panda_joint_v3_tefix_250k"
+DEFAULT_RUN = "hiro_pickcube_panda_v5_pbrs_250k"
 
 # Tags we care about for diagnosing a reward collapse.
 KEY_TAGS = [
@@ -22,6 +22,7 @@ KEY_TAGS = [
     "high/q_loss", "high/actor_loss", "high/alpha", "high/alpha_loss",
     "data/mean_intrinsic_reward", "data/mean_manager_reward",
     "data/mean_subgoal_norm", "data/low_buffer", "data/high_buffer",
+    "data/grasp_rate",
 ]
 
 

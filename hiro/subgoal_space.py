@@ -124,6 +124,50 @@ class SubgoalSpace:
         residual = self.subgoal_transition(s, g, s_next)
         return -torch.norm(residual, dim=-1)
 
+    def phased_pbrs_intrinsic_reward(
+        self,
+        s: torch.Tensor,                # (..., obs_dim)
+        g: torch.Tensor,                # (..., subgoal_dim)
+        s_next: torch.Tensor,           # (..., obs_dim)
+        is_grasped_s: torch.Tensor,     # (...,)  is_grasped at the CURRENT state s
+        is_grasped_s_next: torch.Tensor,  # (...,) is_grasped at the next state s'
+        gamma: float,                   # MUST equal the worker's MDP discount factor (gamma_low)
+        alpha: float,                   # strength of the grasp potential
+    ) -> torch.Tensor:                  # (...,)
+        """Phase-aware worker reward with potential-based grasp shaping (Ng et al. 1999).
+
+            r = -||hand_residual||                                  always active
+              + is_grasped(s) * (-||object_residual||)              gated by current grasp
+              + γ·α·is_grasped(s')  −  α·is_grasped(s)              PBRS shaping
+
+        The PBRS term is policy-invariant by Ng's theorem: every drop-regrasp
+        cycle costs α(1−γ), so the grasp signal cannot be farmed. γ must equal
+        the worker's MDP discount factor for the invariance to hold exactly.
+
+        The cube term is gated by is_grasped(s) (the state the action was taken
+        in), NOT by is_grasped(s'). This means:
+          - grasp step (s=F, s'=T): cube term off (no penalty for "far cube" at
+            the moment of acquisition); only the PBRS +γα bonus fires.
+          - drop step (s=T, s'=F): cube term ON with the residual-at-drop, plus
+            the PBRS -α. Drops at the goal (cube_residual ≈ 0) only pay -α;
+            drops in transit get the position-proportional cube penalty too.
+
+        `hand_positions` / `object_positions` are positions within the subgoal
+        vector; only `indices` differ between HIRO (absolute positions) and
+        object-centric (relative offsets). The env reward is NOT touched -- this
+        is only the low-level/worker reward.
+        """
+        residual = self.subgoal_transition(s, g, s_next)
+        hand_term = -torch.norm(residual[..., self.hand_positions], dim=-1)
+        if self.object_positions:
+            cube_term = -torch.norm(residual[..., self.object_positions], dim=-1)
+        else:
+            cube_term = torch.zeros_like(hand_term)
+        igs = is_grasped_s.to(hand_term.dtype)
+        igs_next = is_grasped_s_next.to(hand_term.dtype)
+        pbrs = gamma * alpha * igs_next - alpha * igs
+        return hand_term + igs * cube_term + pbrs
+
     def phased_intrinsic_reward(
         self,
         s: torch.Tensor,             # (..., obs_dim)
@@ -197,11 +241,15 @@ HIRO_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
     ),
     "StackCube-v1": SubgoalSpace(
         indices=[18, 19, 20,   # tcp_xyz   : extra.tcp_pose[:3]   starts at obs[18]  (HAND)
-                 25, 26, 27,   # cubeA_xyz : extra.cubeA_pose[:3] starts at obs[25]  (OBJECT)
-                 32, 33, 34],  # cubeB_xyz : extra.cubeB_pose[:3] starts at obs[32]
+                 25, 26, 27],  # cubeA_xyz : extra.cubeA_pose[:3] starts at obs[25]  (OBJECT)
+        # cubeB_xyz (obs[32:35]) deliberately EXCLUDED: cubeB is the static target
+        # and never moves. Including it would put a flat -||g_cubeB|| penalty into
+        # the worker reward that no action can ever reduce (the same pathology that
+        # blocked v1-v3). cubeB position is still in obs, so the manager can still
+        # condition on "where to place cubeA"; it just isn't a subgoal dim.
         obs_dim=48,
-        label="tcp_xyz+cubeA_xyz+cubeB_xyz",
-        object_dims=(3, 4, 5),  # cubeA is the grasped object; cubeB (6,7,8) is the static target (TODO: revisit)
+        label="tcp_xyz+cubeA_xyz",
+        object_dims=(3, 4, 5),  # cubeA dims are grasp-gated
     ),
 }
 

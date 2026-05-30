@@ -152,9 +152,11 @@ def verify_stack_cube(sim_backend: str = "physx_cpu") -> None:
     print("     PASS")
 
     # ------------------------------------------------------------------
-    # A3: subgoal_indices=[18,19,20, 25,26,27, 32,33,34] select xyz only.
+    # A3: subgoal_indices=[18,19,20, 25,26,27] select xyz only (cubeB excluded
+    #     intentionally: it's the static target, never moves, so including it
+    #     would inject an action-independent penalty into the worker reward).
     # ------------------------------------------------------------------
-    print(f"\n[A3] Subgoal indices {space.indices} select xyz only (no quaternion dims)")
+    print(f"\n[A3] Subgoal indices {space.indices} select xyz only (no quaternion dims; cubeB excluded by design)")
     quat_blocks = set(range(21, 25)) | set(range(28, 32)) | set(range(35, 39))
     for idx in space.indices:
         assert idx not in quat_blocks, (
@@ -163,7 +165,7 @@ def verify_stack_cube(sim_backend: str = "physx_cpu") -> None:
     subgoal_vals = s[space.indices]
     print(f"     tcp_xyz   obs[18:21] = {s[18:21]}")
     print(f"     cubeA_xyz obs[25:28] = {s[25:28]}")
-    print(f"     cubeB_xyz obs[32:35] = {s[32:35]}")
+    print(f"     cubeB_xyz obs[32:35] = {s[32:35]}  (context only, NOT a subgoal dim)")
     print(f"     subgoal values       = {subgoal_vals}")
     print("     (Values should be plausible Cartesian coordinates, not unit-norm)")
     print("     PASS")

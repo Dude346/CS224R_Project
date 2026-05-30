@@ -56,7 +56,11 @@ class TrainArgs:
     gamma_high: float = 0.8
     tau: float = 0.005
     use_phased_reward: bool = True
-    grasp_bonus: float = 0.1
+    pbrs_alpha: float = 0.5            # PBRS grasp potential strength (replaces grasp_bonus)
+    # partial_reset=True: episodes end on TRUE termination (env success), not just
+    # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
+    # success). Flat SAC baselines used False to match upstream.
+    partial_reset: bool = True
     policy_lr: float = 3e-4
     q_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -106,9 +110,19 @@ def build_envs(args: TrainArgs, run_name: str):
             save_trajectory=False, save_video=True,
             max_steps_per_video=args.num_eval_steps, video_fps=30,
         )
-    # ignore_terminations=True => synchronous resets at the horizon, matching the
-    # flat SAC baseline (bootstrap_at_done="always").
-    envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=True, record_metrics=True)
+    # partial_reset=True (default for HIRO) => TRAINING envs end and auto-reset on
+    # TRUE env termination (e.g. PickCube success), not just at the 50-step horizon.
+    # Avoids the per-step shaped-reward drag on successful trajectories.
+    # Set False to match the flat SAC baseline's "always run to horizon" behaviour.
+    #
+    # EVAL envs always run to horizon (ignore_terminations=True). Two reasons:
+    # (1) ManiSkill asserts reconfiguration_freq=0 under partial_reset, and we
+    #     want reconfiguration_freq=1 on eval to randomize object poses per eval;
+    # (2) measuring success_once over a fixed 50-step horizon gives a stable,
+    #     comparable metric across runs -- the PBRS post-success drag is purely
+    #     a training-time issue and irrelevant when we're not learning from reward.
+    ignore_term_train = not args.partial_reset
+    envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=ignore_term_train, record_metrics=True)
     eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=True, record_metrics=True)
     return envs, eval_envs
 
@@ -187,14 +201,15 @@ def train(args: TrainArgs) -> str:
         policy_lr=args.policy_lr, q_lr=args.q_lr, alpha_lr=args.alpha_lr,
         num_candidates=args.num_candidates,
         use_off_policy_correction=args.use_off_policy_correction,
-        use_phased_reward=args.use_phased_reward, grasp_bonus=args.grasp_bonus,
+        use_phased_reward=args.use_phased_reward, pbrs_alpha=args.pbrs_alpha,
         device=args.device,
     )
     agent = HIROAgent(sp, cfg)
     if args.use_phased_reward:
         agent.grasp_detector = get_grasp_detector(args.env_id)
-        print(f"phased worker reward: detector={'set' if agent.grasp_detector else 'NONE'} "
-              f"| object_dims={sp.object_positions} | grasp_bonus={args.grasp_bonus}")
+        print(f"phased worker reward (PBRS): detector={'set' if agent.grasp_detector else 'NONE'} "
+              f"| object_dims={sp.object_positions} | pbrs_alpha={args.pbrs_alpha} "
+              f"| gamma_low={args.gamma_low}")
 
     low_buf = LowLevelBuffer(args.low_buffer_size, args.num_envs, obs_dim, sp.dim, act_dim,
                              storage_device=args.buffer_device, sample_device=args.device)
@@ -242,7 +257,14 @@ def train(args: TrainArgs) -> str:
             next_obs, reward, terminations, truncations, infos = envs.step(action)
             episode_end = (truncations | terminations).bool()
             real_next_obs = next_obs.clone()
-            bootstrap_done = torch.zeros(args.num_envs, device=device)  # "always" bootstrap
+            # bootstrap_done = 1 only on TRUE env terminations (success), so the
+            # worker doesn't extrapolate Q past a real terminal state. Under
+            # ignore_terminations=True (partial_reset=False) the wrapper forces
+            # terminations to all-False, so this is all-zeros == "always bootstrap"
+            # (matches the old behaviour). Under partial_reset=True, this stops
+            # the worker from bootstrapping past success — critical when shaping
+            # rewards (PBRS) charge per-step costs.
+            bootstrap_done = terminations.float()
             if "final_info" in infos:
                 need_final = episode_end
                 real_next_obs[need_final] = infos["final_observation"][need_final]

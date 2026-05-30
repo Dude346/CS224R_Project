@@ -63,7 +63,11 @@ class TestConstruction:
         assert HIRO_SUBGOAL_SPACES["PickCube-v1"].dim == 6
 
     def test_canonical_stackcube_dim(self):
-        assert HIRO_SUBGOAL_SPACES["StackCube-v1"].dim == 9
+        # StackCube subgoal = tcp_xyz + cubeA_xyz (6 dims).
+        # cubeB is deliberately excluded -- it's the static target, never moves,
+        # so including it would put an action-independent penalty in the worker
+        # reward (the same pathology that blocked the early HIRO runs).
+        assert HIRO_SUBGOAL_SPACES["StackCube-v1"].dim == 6
 
     def test_get_subgoal_space_unknown_raises(self):
         with pytest.raises(ValueError):
@@ -288,6 +292,111 @@ class TestPhasedReward:
         plain = sp.intrinsic_reward(s, g, sn)
         phased = sp.phased_intrinsic_reward(s, g, sn, torch.tensor(1.0), torch.tensor(0.0))
         assert torch.allclose(plain, phased)
+
+
+# ---------------------------------------------------------------------------
+# Potential-Based Reward Shaping (Ng et al. 1999) — the v5 worker reward.
+# Φ(s) = α · is_grasped(s);  shaping = γ·Φ(s') − Φ(s).
+#
+# Per-transition shaping payouts (γ=0.95, α=0.5):
+#   F → F:           γ·0 − 0   = 0
+#   F → T (grasp):   γα − 0    = +0.475
+#   T → T (hold):    γα − α    = -0.025  (small per-step "tax")
+#   T → F (drop):    γ·0 − α   = -0.5
+#
+# Non-hackability: one drop-regrasp cycle nets α(γ−1) = -0.025 < 0.
+# ---------------------------------------------------------------------------
+
+class TestPBRSReward:
+    GAMMA = 0.95
+    ALPHA = 0.5
+
+    @pytest.fixture
+    def psp(self) -> SubgoalSpace:
+        # Same fixture as TestPhasedReward: hand=dims[0,1], object=dims[2,3].
+        return SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=4, object_dims=(2, 3))
+
+    @staticmethod
+    def _setup():
+        # Zero residual so we can read off the PBRS payout cleanly.
+        s = torch.zeros(4)
+        g = torch.zeros(4)
+        s_next = torch.zeros(4)
+        return s, g, s_next
+
+    def _r(self, psp, igs, igs_next):
+        s, g, sn = self._setup()
+        return psp.phased_pbrs_intrinsic_reward(
+            s, g, sn, torch.tensor(float(igs)), torch.tensor(float(igs_next)),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+        ).item()
+
+    def test_F_to_F_no_shaping(self, psp):
+        assert self._r(psp, igs=0, igs_next=0) == pytest.approx(0.0)
+
+    def test_F_to_T_grasp_bonus(self, psp):
+        # +γα at grasp acquisition; cube_term off because is_grasped(s)=F.
+        assert self._r(psp, igs=0, igs_next=1) == pytest.approx(self.GAMMA * self.ALPHA)
+
+    def test_T_to_T_sustained_hold_tax(self, psp):
+        # α(γ−1) per step; cube_term active (=0 since residual=0).
+        assert self._r(psp, igs=1, igs_next=1) == pytest.approx(self.ALPHA * (self.GAMMA - 1.0))
+
+    def test_T_to_F_drop_penalty(self, psp):
+        # -α at drop; cube_term active (=0 since residual=0).
+        assert self._r(psp, igs=1, igs_next=0) == pytest.approx(-self.ALPHA)
+
+    def test_drop_regrasp_cycle_is_negative(self, psp):
+        """The cornerstone non-hackability property: a drop-then-regrasp cycle
+        must net strictly negative, so the agent cannot farm the grasp bonus."""
+        drop = self._r(psp, igs=1, igs_next=0)         # -α
+        regrasp = self._r(psp, igs=0, igs_next=1)      # +γα
+        cycle = drop + regrasp
+        assert cycle < 0
+        assert cycle == pytest.approx(self.ALPHA * (self.GAMMA - 1.0))
+
+    def test_drop_step_also_pays_cube_term(self, psp):
+        # On a drop step with nonzero residual the worker pays BOTH the cube_term
+        # penalty (proportional to residual) AND the PBRS -α.
+        s = torch.zeros(4)
+        g = torch.tensor([0.0, 0.0, 1.0, 0.0])   # object subgoal = move dim2 by 1
+        s_next = torch.zeros(4)                  # object didn't move => residual = 1.0
+        r = psp.phased_pbrs_intrinsic_reward(
+            s, g, s_next, torch.tensor(1.0), torch.tensor(0.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+        ).item()
+        # cube_term = -1.0 (gated on by is_grasped(s)=1); PBRS = -α
+        assert r == pytest.approx(-1.0 - self.ALPHA)
+
+    def test_grasp_step_no_cube_penalty(self, psp):
+        # At the grasp step is_grasped(s)=F, so cube_term is OFF -- the worker
+        # isn't punished for "the cube is far" at the moment it just grasped.
+        s = torch.zeros(4)
+        g = torch.tensor([0.0, 0.0, 1.0, 0.0])
+        s_next = torch.zeros(4)
+        r = psp.phased_pbrs_intrinsic_reward(
+            s, g, s_next, torch.tensor(0.0), torch.tensor(1.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+        ).item()
+        # cube_term=0 (gate off); PBRS = +γα; hand_term = 0
+        assert r == pytest.approx(self.GAMMA * self.ALPHA)
+
+    def test_batched(self, psp):
+        s = torch.zeros(4, 4)
+        g = torch.zeros(4, 4)
+        sn = torch.zeros(4, 4)
+        igs = torch.tensor([0.0, 0.0, 1.0, 1.0])      # F, F, T, T
+        igs_next = torch.tensor([0.0, 1.0, 1.0, 0.0]) # F, T, T, F
+        r = psp.phased_pbrs_intrinsic_reward(
+            s, g, sn, igs, igs_next, gamma=self.GAMMA, alpha=self.ALPHA,
+        )
+        expected = torch.tensor([
+            0.0,
+            self.GAMMA * self.ALPHA,
+            self.ALPHA * (self.GAMMA - 1.0),
+            -self.ALPHA,
+        ])
+        assert torch.allclose(r, expected)
 
 
 # ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ before training.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Protocol, Sequence
 
 import torch
 
@@ -255,15 +255,29 @@ HIRO_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
 
 
 # ---------------------------------------------------------------------------
-# Embodiment-independent grasp detector.
-# Uses POSITIONS only (gripper->object vector + object height), never contact
-# forces, so the SAME fixed thresholds apply to every embodiment (stock or
-# weakened gripper). is_grasped := object is close to the gripper AND lifted off
-# the table — a strong, force-free "the object is under control" signal.
+# Grasp-state readers for the phased/PBRS worker reward.
+# PickCube already exposes a true binary is_grasped flag in the observation, so
+# use that directly. StackCube does not, so it falls back to the old position-
+# only heuristic. Keeping the interface callable lets the agent/trainer stay
+# unchanged while giving PickCube the exact signal the env already computes.
 # ---------------------------------------------------------------------------
 
+class GraspReader(Protocol):
+    def __call__(self, obs: torch.Tensor) -> torch.Tensor:
+        ...
+
+
 @dataclass
-class GraspDetector:
+class ObsBitGraspReader:
+    obs_index: int
+    threshold: float = 0.5
+
+    def __call__(self, obs: torch.Tensor) -> torch.Tensor:
+        return obs[..., self.obs_index] > self.threshold
+
+
+@dataclass
+class PositionalGraspDetector:
     tcp_to_obj_indices: tuple[int, int, int]  # obs indices of the gripper->object vector
     obj_z_index: int                          # obs index of the object's height (z)
     near_threshold: float = 0.05              # gripper within 5 cm of the object
@@ -275,15 +289,16 @@ class GraspDetector:
         return (dist < self.near_threshold) & (z > self.lift_threshold)
 
 
-GRASP_DETECTORS: dict[str, GraspDetector] = {
-    # PickCube: tcp_to_obj = obs[36:39]; cube_z = obs[31].
-    "PickCube-v1": GraspDetector(tcp_to_obj_indices=(36, 37, 38), obj_z_index=31),
-    # StackCube: tcp_to_cubeA = obs[39:42]; cubeA_z = obs[27].
-    "StackCube-v1": GraspDetector(tcp_to_obj_indices=(39, 40, 41), obj_z_index=27),
+GRASP_DETECTORS: dict[str, GraspReader] = {
+    # PickCube exposes the true task grasp bit at obs[18]; use it directly.
+    "PickCube-v1": ObsBitGraspReader(obs_index=18),
+    # StackCube has no explicit grasp bit in obs_mode="state", so use the
+    # embodiment-independent positional heuristic for cubeA.
+    "StackCube-v1": PositionalGraspDetector(tcp_to_obj_indices=(39, 40, 41), obj_z_index=27),
 }
 
 
-def get_grasp_detector(env_id: str) -> "GraspDetector | None":
+def get_grasp_detector(env_id: str) -> "GraspReader | None":
     return GRASP_DETECTORS.get(env_id)
 
 

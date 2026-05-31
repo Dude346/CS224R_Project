@@ -45,7 +45,7 @@ before training.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Protocol
 
 import torch
 
@@ -182,51 +182,74 @@ class SubgoalSpace:
         pbrs = gamma * alpha * igs_next - alpha * igs
         return hand_term + igs * cube_term + pbrs
 
-    def phased_progress_pbrs_intrinsic_reward(
+    def task_potential_intrinsic_reward(
         self,
-        s: torch.Tensor,                # (..., obs_dim)
-        g: torch.Tensor,                # (..., subgoal_dim) current residual-to-target at s
-        s_next: torch.Tensor,           # (..., obs_dim)
-        is_grasped_s: torch.Tensor,     # (...,)
+        s: torch.Tensor,                  # (..., obs_dim)
+        g: torch.Tensor,                  # (..., subgoal_dim) manager residual-to-target at s
+        s_next: torch.Tensor,             # (..., obs_dim)
+        is_grasped_s: torch.Tensor,       # (...,)
         is_grasped_s_next: torch.Tensor,  # (...,)
-        gamma: float,
-        alpha: float,
-        near_positions: Sequence[int],
-        near_threshold: float = 0.04,
-        stall_penalty: float = 0.05,
         reach_coef: float = 1.0,
-        reach_temp: float = 10.0,
-        gripper_qpos_indices: Sequence[int] | None = None,
-        open_penalty_scale: float = 0.08,
-        max_open_aperture: float = 0.04,
+        grasp_coef: float = 1.0,
+        place_coef: float = 1.0,
+        tanh_temp: float = 5.0,
     ) -> torch.Tensor:
-        """Progress-shaped worker reward for object-centric PickCube.
+        """Farming-proof worker reward for object-centric PickCube.
 
-        Uses *progress* in the manager-conditioned residual rather than the
-        absolute next residual. This makes "hover near the cube" unattractive:
-        once progress stalls, the reward goes to ~0, and near-without-grasp is
-        further penalized by `stall_penalty`.
+        REPLACES the old `phased_progress_pbrs_intrinsic_reward`, whose ungated
+        `dense_reach` term paid ~+1/step just for keeping the gripper on the cube
+        (no lifting required). That term (a) created a "grasp-and-hold" local
+        optimum and (b) drowned the only transport signal (`object_progress`) at
+        ~1% of the per-step reward, so the worker never lifted the cube to the
+        (aerial) goal — exactly the observed plateau.
+
+        Every term here is a *telescoping difference* of a potential, so by Ng et
+        al. (1999) it is policy-invariant and cannot be farmed by hovering or by
+        drop/regrasp cycling, and — crucially — there is NO per-step "hold tax",
+        so reaching and holding the success state is never penalised.
+
+        Task potential (object-centric layout: the projected subgoal vector IS
+        [tcp_to_obj (hand dims), obj_to_goal (object dims)], so these distances
+        are read straight off `project`). It mirrors PickCube's own dense reward:
+
+            Φ(x) = reach_coef · (1 − tanh(k·‖tcp_to_obj(x)‖))
+                 + grasp_coef · is_grasped(x)
+                 + place_coef · is_grasped(x) · (1 − tanh(k·‖obj_to_goal(x)‖))
 
         Reward:
-            hand_progress   = ||g_hand|| - ||g'_hand||
-            object_progress = ||g_obj || - ||g'_obj ||
-            pbrs            = γ·α·is_grasped(s') − α·is_grasped(s)
-            dense_reach     = c · (1 - tanh(t · ||tcp_to_obj(s')||))   [ungated]
-            open_penalty    = k · normalized_aperture(s')
-                              only when near the cube and not yet grasped
+            r = Φ(s') − Φ(s)                               # task shaping (γ=1 telescope)
+              + (‖g_hand‖ − ‖g'_hand‖)                     # follow the manager hand target
+              + is_grasped(s) · (‖g_obj‖ − ‖g'_obj‖)       # follow the manager place target
 
-            r = hand_progress
-              + dense_reach
-              + is_grasped(s) * object_progress
-              + pbrs
-              - stall_penalty * 1[ near(s') and not grasped(s') ]
-              - open_penalty
+        Φ is maximised at success (gripper on cube, grasped, cube at goal), so
+        climbing Φ solves the task; holding static costs 0; *leaving* a high-Φ
+        state — including dropping the cube — costs back the Φ it gives up, which
+        is what makes lifting strictly better than holding.
 
-        `near_positions` are positions within the projected subgoal state used
-        to define "near the cube". For PickCube object-centric this is simply
-        the tcp_to_obj block.
+        γ=1 (a pure potential difference) rather than γ·Φ(s')−Φ(s) is deliberate:
+        with γ<1 the shaping leaves a residual −(1−γ)·Φ hold-tax that penalises
+        the success state every step it is held (the old PBRS pathology). The
+        telescoping form sums to Φ(s_T)−Φ(s_0) over an episode, a path-independent
+        constant that does not change the optimal policy.
         """
+        proj_s = self.project(s)
+        proj_sn = self.project(s_next)
         next_residual = self.subgoal_transition(s, g, s_next)
+
+        igs = is_grasped_s.to(s.dtype)
+        igs_next = is_grasped_s_next.to(s.dtype)
+
+        def _potential(proj: torch.Tensor, grasp: torch.Tensor) -> torch.Tensor:
+            reach_dist = torch.norm(proj[..., self.hand_positions], dim=-1)
+            phi = reach_coef * (1.0 - torch.tanh(tanh_temp * reach_dist))
+            phi = phi + grasp_coef * grasp
+            if self.object_positions:
+                place_dist = torch.norm(proj[..., self.object_positions], dim=-1)
+                phi = phi + place_coef * grasp * (1.0 - torch.tanh(tanh_temp * place_dist))
+            return phi
+
+        task_shaping = _potential(proj_sn, igs_next) - _potential(proj_s, igs)
+
         hand_now = torch.norm(g[..., self.hand_positions], dim=-1)
         hand_next = torch.norm(next_residual[..., self.hand_positions], dim=-1)
         hand_progress = hand_now - hand_next
@@ -238,27 +261,7 @@ class SubgoalSpace:
         else:
             object_progress = torch.zeros_like(hand_progress)
 
-        igs = is_grasped_s.to(hand_progress.dtype)
-        igs_next = is_grasped_s_next.to(hand_progress.dtype)
-        pbrs = gamma * alpha * igs_next - alpha * igs
-
-        projected_next = self.project(s_next)
-        near_dist = torch.norm(projected_next[..., list(near_positions)], dim=-1)
-        dense_reach = reach_coef * (1.0 - torch.tanh(reach_temp * near_dist))
-        hovering = (near_dist < near_threshold) & (~is_grasped_s_next.bool())
-        stall = hovering.to(hand_progress.dtype) * stall_penalty
-        open_penalty = torch.zeros_like(hand_progress)
-        if gripper_qpos_indices is not None:
-            aperture_next = s_next[..., list(gripper_qpos_indices)].mean(dim=-1)
-            open_fraction = torch.clamp(aperture_next / max_open_aperture, min=0.0, max=1.0)
-            open_when_near = hovering
-            open_penalty = (
-                open_when_near.to(hand_progress.dtype)
-                * open_penalty_scale
-                * open_fraction
-            )
-
-        return hand_progress + dense_reach + igs * object_progress + pbrs - stall - open_penalty
+        return task_shaping + hand_progress + igs * object_progress
 
     def phased_intrinsic_reward(
         self,

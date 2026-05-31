@@ -44,7 +44,7 @@ def train_hiro(
     seed: int = 1,
     total_timesteps: int = 1_000_000,
     num_envs: int = 32,
-    eval_freq: int = 50_000,
+    eval_freq: int = 10_000,
     learning_starts: int = 4_000,
     c: int = 10,
     subgoal_scale: float = 0.15,
@@ -55,7 +55,7 @@ def train_hiro(
     use_off_policy_correction: bool = True,
     use_phased_reward: bool = True,
     pbrs_alpha: float = 0.1,
-    latent_subgoal_dim: int = 4,
+    latent_subgoal_dim: int = 6,
     partial_reset: bool = False,
     track: bool = False,
     capture_video: bool = True,
@@ -150,7 +150,7 @@ def main(
     low_buffer_size: int = 100_000,
     high_buffer_size: int = 20_000,
     use_off_policy_correction: bool = True,
-    latent_subgoal_dim: int = 4,
+    latent_subgoal_dim: int = 6,
     track: bool = False,
 ):
     """Foreground run. Defaults are SMOKE-sized; pass real sizes for a full run."""
@@ -193,7 +193,7 @@ def launch(
     c: int = 10,
     subgoal_scale: float = 0.15,
     use_off_policy_correction: bool = True,
-    latent_subgoal_dim: int = 4,
+    latent_subgoal_dim: int = 6,
     track: bool = True,
 ):
     """Detached spawn for a full run."""

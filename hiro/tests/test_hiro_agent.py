@@ -93,44 +93,44 @@ class TestActionSelection:
 
 
 class TestWorkerRewardSelection:
-    def test_object_centric_pickcube_uses_progress_reward_path(self):
+    def test_object_centric_pickcube_rewards_reaching_pregrasp(self):
         sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
         cfg = HIROConfig(action_dim=ACT, c=5, subgoal_scale=SCALE, device="cpu")
         ag = HIROAgent(sp, cfg)
         ag.grasp_detector = lambda obs: obs[..., 18] > 0.5
 
+        # tcp_to_obj = obs[36:39]; not grasped (obs[18]=0). Moving the hand
+        # closer to the cube must be rewarded by the task-potential path.
         s = torch.zeros(1, OBS)
-        s[:, 36] = 0.03  # already near the cube
+        s[:, 36] = 0.20
+        sn = torch.zeros(1, OBS)
+        sn[:, 36] = 0.10
         g = torch.zeros(1, SG)
-        sn = s.clone()
 
         r = ag.worker_reward(s, g, sn)
-        # No progress but hand parked on the object -> dense reach term should
-        # still make this positive, which is the intended "park and explore"
-        # behaviour from the branch fix.
         assert r.shape == (1,)
         assert r.item() > 0.0
 
-    def test_object_centric_pickcube_reduces_penalty_when_closing_near_cube(self):
+    def test_object_centric_pickcube_lifting_beats_holding(self):
+        """Agent-level guard for the bug that caused the plateau: once grasped,
+        moving the cube toward the goal must beat holding it static."""
         sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
         cfg = HIROConfig(action_dim=ACT, c=5, subgoal_scale=SCALE, device="cpu")
         ag = HIROAgent(sp, cfg)
         ag.grasp_detector = lambda obs: obs[..., 18] > 0.5
 
+        # grasped (obs[18]=1), gripper on cube (tcp_to_obj=0), cube 0.2 from goal.
         s = torch.zeros(1, OBS)
-        s[:, 36] = 0.03
-        s[:, 7] = 0.04
-        s[:, 8] = 0.04
+        s[:, 18] = 1.0
+        s[:, 39] = 0.20            # obj_to_goal = obs[39:42]
         g = torch.zeros(1, SG)
-        sn = s.clone()
-        sn[:, 7] = 0.02
-        sn[:, 8] = 0.02
-        r_close = ag.worker_reward(s, g, sn)
 
-        sn_open = s.clone()
-        r_open = ag.worker_reward(s, g, sn_open)
-        assert r_close.shape == (1,)
-        assert r_close.item() > r_open.item()
+        sn_hold = s.clone()
+        sn_lift = s.clone()
+        sn_lift[:, 39] = 0.10      # cube halved its distance to the goal
+        r_hold = ag.worker_reward(s, g, sn_hold)
+        r_lift = ag.worker_reward(s, g, sn_lift)
+        assert r_lift.item() > r_hold.item()
 
 
 class TestLatentInterface:

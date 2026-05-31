@@ -458,140 +458,91 @@ class TestPBRSReward:
         assert torch.allclose(r, expected)
 
 
-class TestProgressPBRSReward:
-    GAMMA = 0.95
-    ALPHA = 0.5
+class TestTaskPotentialReward:
+    """The farming-proof worker reward that replaced the dense_reach version.
+
+    Layout matches object-centric PickCube: projected subgoal = [hand dims
+    (tcp_to_obj), object dims (obj_to_goal)]. Defaults reach=grasp=place=1,
+    tanh_temp=5. Every term is a telescoping potential difference, so the key
+    invariants are: holding static pays 0 (no hold tax / no farming), progress
+    up the task potential pays positive, and giving up potential (e.g. dropping)
+    pays negative.
+    """
 
     @pytest.fixture
     def psp(self) -> SubgoalSpace:
+        # dims 0,1 = tcp_to_obj (hand); dims 2,3 = obj_to_goal (object)
         return SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=4, object_dims=(2, 3))
 
-    def test_dense_reach_prefers_near_over_far(self, psp):
-        s = torch.zeros(4)
-        g = torch.zeros(4)
-        sn_near = torch.tensor([0.03, 0.0, 0.0, 0.0])
-        sn_far = torch.tensor([0.30, 0.0, 0.0, 0.0])
-        r_near = psp.phased_progress_pbrs_intrinsic_reward(
-            s, g, sn_near,
-            torch.tensor(0.0), torch.tensor(0.0),
-            gamma=self.GAMMA, alpha=self.ALPHA,
-            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
-            reach_coef=1.0, reach_temp=10.0,
-        )
-        r_far = psp.phased_progress_pbrs_intrinsic_reward(
-            s, g, sn_far,
-            torch.tensor(0.0), torch.tensor(0.0),
-            gamma=self.GAMMA, alpha=self.ALPHA,
-            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
-            reach_coef=1.0, reach_temp=10.0,
-        )
-        assert r_near.item() > r_far.item()
+    def _r(self, psp, s, g, sn, gs, gsn):
+        return psp.task_potential_intrinsic_reward(
+            s, g, sn, torch.tensor(gs), torch.tensor(gsn)
+        ).item()
 
-    def test_grasp_bonus_survives_progress_reward(self, psp):
-        s = torch.zeros(4)
-        g = torch.tensor([0.02, 0.0, 0.0, 1.0])
-        sn = torch.tensor([0.02, 0.0, 0.0, 0.0])
-        r = psp.phased_progress_pbrs_intrinsic_reward(
-            s, g, sn,
-            torch.tensor(0.0), torch.tensor(1.0),
-            gamma=self.GAMMA, alpha=self.ALPHA,
-            near_positions=(0, 1), near_threshold=0.06, stall_penalty=0.05,
+    def test_lifting_beats_holding_post_grasp(self, psp):
+        """THE property the old reward violated: once grasped, moving the cube
+        toward the goal must earn strictly more than holding it static."""
+        # gripper on cube (tcp_to_obj = 0); cube starts 0.2 from goal.
+        s = torch.tensor([0.0, 0.0, 0.20, 0.0])
+        g = torch.zeros(4)
+        sn_hold = s.clone()                              # cube unmoved
+        sn_lift = torch.tensor([0.0, 0.0, 0.10, 0.0])    # cube halved its goal distance
+        r_hold = self._r(psp, s, g, sn_hold, 1.0, 1.0)
+        r_lift = self._r(psp, s, g, sn_lift, 1.0, 1.0)
+        assert r_lift > r_hold
+        assert r_hold == pytest.approx(0.0, abs=1e-6)    # no hold tax
+
+    def test_static_hold_pays_zero(self, psp):
+        """No state change + zero subgoal residual delta => exactly 0 (cannot be
+        farmed by sitting still in any phase)."""
+        s = torch.tensor([0.05, 0.0, 0.15, 0.0])
+        for gs in (0.0, 1.0):
+            r = self._r(psp, s, torch.zeros(4), s.clone(), gs, gs)
+            assert r == pytest.approx(0.0, abs=1e-6)
+
+    def test_hover_near_cube_without_grasp_is_not_farmable(self, psp):
+        """Parking the gripper on the cube without grasping pays ~0 (the old
+        dense_reach paid ~+1/step here)."""
+        s = torch.zeros(4)                  # tcp_to_obj = 0, not grasped
+        r = self._r(psp, s, torch.zeros(4), s.clone(), 0.0, 0.0)
+        assert r == pytest.approx(0.0, abs=1e-6)
+
+    def test_reaching_toward_cube_is_rewarded_pregrasp(self, psp):
+        s = torch.tensor([0.20, 0.0, 0.0, 0.0])
+        sn = torch.tensor([0.10, 0.0, 0.0, 0.0])         # hand closer to cube
+        r = self._r(psp, s, torch.zeros(4), sn, 0.0, 0.0)
+        assert r > 0.0
+
+    def test_grasp_acquisition_is_rewarded(self, psp):
+        s = torch.tensor([0.0, 0.0, 0.30, 0.0])          # at cube, far from goal
+        sn = s.clone()
+        r = self._r(psp, s, torch.zeros(4), sn, 0.0, 1.0)  # grasp flips on
+        assert r > 0.0
+
+    def test_dropping_is_penalized(self, psp):
+        s = torch.zeros(4)                               # grasped, cube at goal
+        sn = s.clone()
+        r = self._r(psp, s, torch.zeros(4), sn, 1.0, 0.0)  # grasp lost
+        assert r < 0.0
+
+    def test_empty_object_dims_has_no_place_term(self):
+        """With no object dims the place potential vanishes; reaching still works."""
+        sp = SubgoalSpace(indices=[0, 1], obs_dim=2)     # hand-only
+        s = torch.tensor([0.20, 0.0])
+        sn = torch.tensor([0.10, 0.0])
+        r = sp.task_potential_intrinsic_reward(
+            s, torch.zeros(2), sn, torch.tensor(0.0), torch.tensor(0.0)
         )
         assert r.item() > 0.0
 
-    def test_dense_reach_persists_post_grasp(self, psp):
-        s = torch.zeros(4)
-        g = torch.zeros(4)
-        sn = torch.tensor([0.02, 0.0, 0.0, 0.0])
-        r_free = psp.phased_progress_pbrs_intrinsic_reward(
-            s, g, sn,
-            torch.tensor(0.0), torch.tensor(0.0),
-            gamma=self.GAMMA, alpha=self.ALPHA,
-            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
-            reach_coef=1.0, reach_temp=10.0,
-        )
-        r_hold = psp.phased_progress_pbrs_intrinsic_reward(
-            s, g, sn,
-            torch.tensor(1.0), torch.tensor(1.0),
-            gamma=self.GAMMA, alpha=self.ALPHA,
-            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
-            reach_coef=1.0, reach_temp=10.0,
-        )
-        assert r_free.item() > 0.0
-        assert r_hold.item() > 0.0
-        assert r_hold.item() == pytest.approx(
-            r_free.item() + 0.05 + self.ALPHA * (self.GAMMA - 1.0), abs=1e-6
-        )
-
-    def test_near_closing_reduces_open_penalty(self):
-        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=10, object_dims=(2, 3))
-        s = torch.zeros(10)
-        s[0] = 0.03            # near the cube
-        s[7] = 0.04            # open fingers
-        s[8] = 0.04
-        g = torch.zeros(4)
-
-        sn_close = s.clone()
-        sn_close[7] = 0.02     # fingers closed some amount
-        sn_close[8] = 0.02
-        r_close = sp.phased_progress_pbrs_intrinsic_reward(
-            s, g, sn_close,
-            torch.tensor(0.0), torch.tensor(0.0),
-            gamma=self.GAMMA, alpha=self.ALPHA,
-            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
-            gripper_qpos_indices=(7, 8), open_penalty_scale=0.08, max_open_aperture=0.04,
-        )
-
-        sn_hold = s.clone()
-        r_hold = sp.phased_progress_pbrs_intrinsic_reward(
-            s, g, sn_hold,
-            torch.tensor(0.0), torch.tensor(0.0),
-            gamma=self.GAMMA, alpha=self.ALPHA,
-            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
-            gripper_qpos_indices=(7, 8), open_penalty_scale=0.08, max_open_aperture=0.04,
-        )
-        assert r_close.item() > r_hold.item()
-
-    def test_far_closing_does_not_change_reward(self):
-        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=10, object_dims=(2, 3))
-        s = torch.zeros(10)
-        s[0] = 0.20            # far from cube
-        s[7] = 0.04
-        s[8] = 0.04
-        g = torch.zeros(4)
-        sn_close = s.clone()
-        sn_close[7] = 0.02
-        sn_close[8] = 0.02
-        r_close = sp.phased_progress_pbrs_intrinsic_reward(
-            s, g, sn_close,
-            torch.tensor(0.0), torch.tensor(0.0),
-            gamma=self.GAMMA, alpha=self.ALPHA,
-            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
-            gripper_qpos_indices=(7, 8), open_penalty_scale=0.08, max_open_aperture=0.04,
-        )
-        sn_open = s.clone()
-        r_open = sp.phased_progress_pbrs_intrinsic_reward(
-            s, g, sn_open,
-            torch.tensor(0.0), torch.tensor(0.0),
-            gamma=self.GAMMA, alpha=self.ALPHA,
-            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
-            gripper_qpos_indices=(7, 8), open_penalty_scale=0.08, max_open_aperture=0.04,
-        )
-        assert r_close.item() == pytest.approx(r_open.item(), abs=1e-6)
-
-    def test_sustained_grasp_has_only_pbrs_hold_tax(self):
-        psp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=4, object_dims=(2, 3))
-        s = torch.zeros(4)
-        g = torch.zeros(4)
-        sn = torch.zeros(4)
-        r = psp.phased_progress_pbrs_intrinsic_reward(
-            s, g, sn,
-            torch.tensor(1.0), torch.tensor(1.0),
-            gamma=self.GAMMA, alpha=self.ALPHA,
-            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
-        )
-        expected_reach = 1.0 - math.tanh(0.0)
-        assert r.item() == pytest.approx(expected_reach + self.ALPHA * (self.GAMMA - 1.0), abs=1e-6)
+    def test_batched_shape(self, psp):
+        s = torch.rand(7, 4) * 0.2
+        g = torch.zeros(7, 4)
+        sn = torch.rand(7, 4) * 0.2
+        gs = (torch.rand(7) > 0.5).float()
+        r = psp.task_potential_intrinsic_reward(s, g, sn, gs, gs)
+        assert r.shape == (7,)
+        assert torch.all(torch.isfinite(r))
 
 
 # ---------------------------------------------------------------------------

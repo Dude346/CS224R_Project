@@ -60,10 +60,12 @@ class HIROConfig:
     use_phased_reward: bool = True      # grasp-gate the object subgoal dims in the worker reward
     pbrs_alpha: float = 0.1             # PBRS grasp potential strength (Φ = α·is_grasped);
                                         # calibrated closer to the intrinsic reward scale
-    latent_subgoal_dim: int = 0         # >0 enables a learned latent bottleneck over the geometric subgoal space
+    latent_subgoal_dim: int = 0         # >0 enables a learned latent code over the geometric subgoal space
     latent_hidden_dim: int = 128
-    latent_pretrain_steps: int = 500
+    latent_pretrain_steps: int = 1000
     latent_pretrain_batch_size: int = 256
+    latent_pretrain_range: float = 2.0  # sample geometric subgoals over +/- range*scale (telescoped
+                                        # residuals routinely exceed the manager's one-step bound)
     latent_lr: float = 1e-3
     hidden_dim: int = 256
     n_hidden: int = 3
@@ -100,7 +102,6 @@ class HIROAgent:
         if base_scale.ndim == 0:
             base_scale = base_scale.expand(self.base_subgoal_dim).clone()
         self.base_scale = base_scale
-        self.latent_scale = torch.ones(sg_dim, dtype=torch.float32, device=self.device)
 
         # --- networks (online) ---
         self.nets: HIRONetworks = build_hiro_networks(
@@ -147,11 +148,7 @@ class HIROAgent:
             cfg.policy_lr, cfg.q_lr, cfg.alpha_lr, target_entropy=te_high,
         )
 
-        # --- subgoal bounds / candidate noise (per-dim tensors on device) ---
-        if self.latent_enabled:
-            self.scale = self.latent_scale.clone()
-        else:
-            self.scale = self.base_scale.clone()
+        # --- candidate noise for the off-policy correction (per-dim, on device) ---
         self.candidate_std = cfg.candidate_std_scale * self.base_scale  # (base_sg_dim,)
 
         # Optional grasp detector (set by the trainer from the env id). When present
@@ -179,17 +176,26 @@ class HIROAgent:
         if self.latent_codec is None or self.cfg.latent_pretrain_steps <= 0:
             return
         optim = torch.optim.Adam(self.latent_codec.parameters(), lr=self.cfg.latent_lr)
+        B = self.cfg.latent_pretrain_batch_size
+        rng = self.cfg.latent_pretrain_range
+        latent_scale = self.latent_codec.latent_scale
         self.latent_codec.train()
         for _ in range(self.cfg.latent_pretrain_steps):
+            # (1) reconstruction on geometric subgoals over a WIDER range than the
+            #     manager's one-step bound, since telescoped residuals exceed it.
             g_base = (
-                torch.rand(
-                    self.cfg.latent_pretrain_batch_size,
-                    self.base_subgoal_dim,
-                    device=self.device,
-                ) * 2.0 - 1.0
-            ) * self.base_scale
+                torch.rand(B, self.base_subgoal_dim, device=self.device) * 2.0 - 1.0
+            ) * (self.base_scale * rng)
             recon = self.latent_codec.reconstruct(g_base)
-            loss = F.mse_loss(recon, g_base)
+            recon_loss = F.mse_loss(recon, g_base)
+            # (2) latent cycle-consistency: the manager emits codes across the FULL
+            #     [-latent_scale, latent_scale] cube, so `decode` must be a right
+            #     inverse of `encode` there -- otherwise large parts of the manager's
+            #     action space decode to extrapolated garbage subgoals.
+            z = (torch.rand(B, self.subgoal_dim, device=self.device) * 2.0 - 1.0) * latent_scale
+            z_cycle = self.latent_codec.encode(self.latent_codec.decode(z))
+            cycle_loss = F.mse_loss(z_cycle, z)
+            loss = recon_loss + cycle_loss
             optim.zero_grad()
             loss.backward()
             optim.step()
@@ -241,15 +247,15 @@ class HIROAgent:
         g_base = self.decode_subgoal(g)
         is_grasped_s = self.grasp_detector(s)
         is_grasped_s_next = self.grasp_detector(s_next)
-        # PickCube object-centric gets a task-aligned progress reward with
-        # negative-only anti-hover / near-and-open penalties.
+        # PickCube object-centric gets the farming-proof task-potential reward:
+        # telescoping potential shaping that mirrors the env's own reach/grasp/
+        # place reward, so the worker is actually rewarded for lifting the cube
+        # to the (aerial) goal rather than parking on it. Coefficients mirror
+        # PickCube's dense-reward weights (reach∈[0,1], grasp=1, place∈[0,1]).
         if self.sp.obs_dim == 42 and self.sp.indices == [36, 37, 38, 39, 40, 41]:
-            return self.sp.phased_progress_pbrs_intrinsic_reward(
+            return self.sp.task_potential_intrinsic_reward(
                 s, g_base, s_next, is_grasped_s, is_grasped_s_next,
-                gamma=self.cfg.gamma_low, alpha=self.cfg.pbrs_alpha,
-                near_positions=(0, 1, 2), near_threshold=0.04, stall_penalty=0.05,
-                reach_coef=1.0, reach_temp=10.0,
-                gripper_qpos_indices=(7, 8), open_penalty_scale=0.08, max_open_aperture=0.04,
+                reach_coef=1.0, grasp_coef=1.0, place_coef=1.0, tanh_temp=5.0,
             )
         return self.sp.phased_pbrs_intrinsic_reward(
             s, g_base, s_next, is_grasped_s, is_grasped_s_next,

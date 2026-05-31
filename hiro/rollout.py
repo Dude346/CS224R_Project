@@ -83,7 +83,8 @@ class HierarchicalRollout:
         resample_obs: torch.Tensor,   # (E, obs)  obs to start the next segment from
         r_env: torch.Tensor,          # (E,)      env reward
         episode_end: torch.Tensor,    # (E,) bool episode ended this step (flush trigger)
-        bootstrap_done: torch.Tensor, # (E,)      SAC done/bootstrap mask stored in buffers
+        bootstrap_done: torch.Tensor, # (E,)      TRUE-termination mask (0 on truncation);
+                                      #           stored as the worker AND manager SAC done
     ) -> torch.Tensor:
         """Process one vectorized transition; returns the updated cur_subgoal."""
         E, c = self.E, self.c
@@ -110,15 +111,22 @@ class HierarchicalRollout:
         idx = flush.nonzero(as_tuple=True)[0]
 
         # 5: flush completed segments to the high-level buffer (BEFORE resetting them).
-        #    The manager's done is the TRUE episode end (a c-boundary mid-episode is
-        #    NOT terminal for the manager — it has a successor segment to bootstrap).
+        #    The manager's done is the TRUE-TERMINATION mask (bootstrap_done), NOT the
+        #    flush trigger episode_end. A c-boundary mid-episode is not terminal (it has
+        #    a successor segment), and crucially neither is a horizon TRUNCATION: the
+        #    episode was only time-limited, so the manager must still bootstrap Q(s_c)
+        #    from it — exactly like the worker. Using episode_end here (the old F3 code)
+        #    wrongly zeroed the manager's bootstrap at every episode end, biasing its
+        #    value targets low. bootstrap_done is 1 only on a genuine env termination
+        #    (e.g. PickCube success); under ignore_terminations it is all-zeros, so the
+        #    manager always bootstraps, matching the worker.
         if idx.numel() > 0:
             self.high.add_batch(
                 self.seg_start_obs[idx],
                 self.seg_subgoal[idx],
                 self.seg_reward[idx],
-                real_next_obs[idx],          # s_c = terminal obs of the segment
-                episode_end[idx].float(),    # F3: manager done = real episode end
+                real_next_obs[idx],            # s_c = terminal obs of the segment
+                bootstrap_done[idx].float(),   # manager done = TRUE termination, not truncation
                 self.seg_obs[idx],
                 self.seg_act[idx],
                 self.seg_len[idx],

@@ -401,6 +401,66 @@ class TestPBRSReward:
 
 
 # ---------------------------------------------------------------------------
+# Dense pre-grasp object-reach term (the grasp-discovery fix)
+# ---------------------------------------------------------------------------
+
+class TestReachTerm:
+    GAMMA, ALPHA = 0.95, 0.5
+
+    @pytest.fixture
+    def psp(self) -> SubgoalSpace:
+        # hand = subgoal dims [0,1], object = subgoal dims [2,3].
+        return SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=4, object_dims=(2, 3))
+
+    def _r(self, psp, s, g, s_next, igs, igs_next, reach_coef, reach_temp=1.0):
+        return psp.phased_pbrs_intrinsic_reward(
+            s, g, s_next,
+            torch.tensor(float(igs)), torch.tensor(float(igs_next)),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            reach_coef=reach_coef, reach_temp=reach_temp,
+        ).item()
+
+    def test_default_coef_zero_is_no_op(self, psp):
+        # With reach_coef=0 (the function default) the reward is unchanged: a far
+        # hand contributes nothing, matching the pre-fix behaviour.
+        s = torch.zeros(4)
+        s_next = torch.tensor([0.0, 0.0, 3.0, 4.0])  # hand=(0,0), object=(3,4): far
+        g = psp.project(s_next) - psp.project(s)      # => residual 0 => hand/cube terms 0
+        with_default = psp.phased_pbrs_intrinsic_reward(
+            s, g, s_next, torch.tensor(0.0), torch.tensor(0.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+        ).item()
+        assert with_default == pytest.approx(0.0)
+
+    def test_pregrasp_hand_on_object_pays_full_coef(self, psp):
+        # Pre-grasp (igs=0), hand exactly on the object (dist=0): reach = coef*(1-tanh 0) = coef.
+        s = torch.zeros(4)
+        s_next = torch.tensor([1.0, 2.0, 1.0, 2.0])  # hand=(1,2)==object=(1,2): dist 0
+        g = psp.project(s_next) - psp.project(s)      # residual 0 => hand/cube terms 0, pbrs 0
+        r = self._r(psp, s, g, s_next, igs=0, igs_next=0, reach_coef=2.0)
+        assert r == pytest.approx(2.0)
+
+    def test_pregrasp_far_hand_negligible_reach(self, psp):
+        # Pre-grasp, hand far from object: 1 - tanh(temp*dist) -> ~0.
+        s = torch.zeros(4)
+        s_next = torch.tensor([0.0, 0.0, 3.0, 4.0])  # dist = 5
+        g = psp.project(s_next) - psp.project(s)
+        r = self._r(psp, s, g, s_next, igs=0, igs_next=0, reach_coef=2.0, reach_temp=5.0)
+        assert r == pytest.approx(2.0 * (1.0 - torch.tanh(torch.tensor(25.0)).item()), abs=1e-5)
+        assert r < 1e-4                               # effectively zero far away
+
+    def test_reach_NOT_gated_after_grasp(self, psp):
+        # The reach term is deliberately UNGATED: post-grasp (igs=1) it persists,
+        # so grasping is not a reward cliff. With the hand on the object (held),
+        # the reward = hold-tax + full reach bonus (NOT hold-tax alone).
+        s = torch.zeros(4)
+        s_next = torch.tensor([1.0, 2.0, 1.0, 2.0])  # hand on object: dist 0 => reach = coef
+        g = psp.project(s_next) - psp.project(s)      # residual 0 => cube_term 0
+        r = self._r(psp, s, g, s_next, igs=1, igs_next=1, reach_coef=2.0)
+        assert r == pytest.approx(self.ALPHA * (self.GAMMA - 1.0) + 2.0)   # hold tax + reach
+
+
+# ---------------------------------------------------------------------------
 # Grasp-state readers
 # ---------------------------------------------------------------------------
 

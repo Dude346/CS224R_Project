@@ -57,6 +57,8 @@ class TrainArgs:
     tau: float = 0.005
     use_phased_reward: bool = True
     pbrs_alpha: float = 0.1            # was 0.5; scaled to ~intrinsic reward magnitude (subgoal_scale*sqrt(3)≈0.26)
+    reach_coef: float = 1.0            # dense PRE-grasp hand→object reach term; fixes grasp-discovery deadlock. 0 disables.
+    reach_temp: float = 5.0            # tanh sharpness of the reach term (1/units of the subgoal space)
     # partial_reset=True: episodes end on TRUE termination (env success), not just
     # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
     # success). Flat SAC baselines used False to match upstream.
@@ -202,6 +204,7 @@ def train(args: TrainArgs) -> str:
         num_candidates=args.num_candidates,
         use_off_policy_correction=args.use_off_policy_correction,
         use_phased_reward=args.use_phased_reward, pbrs_alpha=args.pbrs_alpha,
+        reach_coef=args.reach_coef, reach_temp=args.reach_temp,
         device=args.device,
     )
     agent = HIROAgent(sp, cfg)
@@ -209,6 +212,7 @@ def train(args: TrainArgs) -> str:
         agent.grasp_detector = get_grasp_detector(args.env_id)
         print(f"phased worker reward (PBRS): detector={'set' if agent.grasp_detector else 'NONE'} "
               f"| object_dims={sp.object_positions} | pbrs_alpha={args.pbrs_alpha} "
+              f"| reach_coef={args.reach_coef} reach_temp={args.reach_temp} "
               f"| gamma_low={args.gamma_low}")
 
     low_buf = LowLevelBuffer(args.low_buffer_size, args.num_envs, obs_dim, sp.dim, act_dim,
@@ -300,21 +304,26 @@ def train(args: TrainArgs) -> str:
                     writer.add_scalar(f"high/{k}", v, global_step)
                 # data diagnostics
                 ls = low_buf.sample(min(args.batch_size, len(low_buf)))
-                writer.add_scalar("data/mean_intrinsic_reward", ls.reward.mean().item(), global_step)
-                writer.add_scalar("data/mean_subgoal_norm", ls.subgoal.norm(dim=-1).mean().item(), global_step)
-                writer.add_scalar("data/low_buffer", len(low_buf), global_step)
-                writer.add_scalar("data/high_buffer", len(high_buf), global_step)
-                # grasp rate: is the worker actually grasping? (key signal for the phased reward)
+                data_log = {
+                    "data/mean_intrinsic_reward": ls.reward.mean().item(),
+                    "data/mean_subgoal_norm":     ls.subgoal.norm(dim=-1).mean().item(),
+                    "data/low_buffer":            len(low_buf),
+                    "data/high_buffer":           len(high_buf),
+                }
                 if agent.grasp_detector is not None:
-                    grasp_rate = agent.grasp_detector(ls.next_obs).float().mean().item()
-                    writer.add_scalar("data/grasp_rate", grasp_rate, global_step)
+                    data_log["data/grasp_rate"] = agent.grasp_detector(ls.next_obs).float().mean().item()
                 if len(high_buf) > 0:
                     hs = high_buf.sample(min(args.batch_size, len(high_buf)))
-                    writer.add_scalar("data/mean_manager_reward", hs.reward_sum.mean().item(), global_step)
+                    data_log["data/mean_manager_reward"] = hs.reward_sum.mean().item()
+                for k, v in data_log.items():
+                    writer.add_scalar(k, v, global_step)
                 if args.track:
                     import wandb
-                    wandb.log({**{f"low/{k}": v for k, v in low_metrics.items()},
-                               **{f"high/{k}": v for k, v in high_metrics.items()}}, step=global_step)
+                    wandb.log({
+                        **{f"low/{k}": v for k, v in low_metrics.items()},
+                        **{f"high/{k}": v for k, v in high_metrics.items()},
+                        **data_log,
+                    }, step=global_step)
 
         # ---- eval ----
         if global_step - last_eval >= args.eval_freq:

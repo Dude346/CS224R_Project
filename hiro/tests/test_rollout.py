@@ -230,12 +230,14 @@ class TestRewardAccumulation:
 # ---------------------------------------------------------------------------
 
 class TestBoundaryFixes:
-    def _step(self, roll, E, episode_end=False):
+    def _step(self, roll, E, episode_end=False, terminal=False):
+        # episode_end = flush trigger (truncation OR termination);
+        # terminal = TRUE env termination -> bootstrap_done (manager/worker SAC done).
         obs = torch.randn(E, OBS)
         nxt = torch.randn(E, OBS)
         return roll.record(
             obs, torch.zeros(E, ACT), nxt, nxt, torch.zeros(E),
-            torch.tensor([episode_end] * E), torch.zeros(E),
+            torch.tensor([episode_end] * E), torch.tensor([float(terminal)] * E),
         )
 
     def test_worker_next_subgoal_at_boundary_is_fresh_goal(self):
@@ -252,13 +254,19 @@ class TestBoundaryFixes:
         # (sanity: the 1st transition's next_subgoal is the transition, not a resample)
         assert low.next_subgoal[0, 0].shape == (SG,)
 
-    def test_manager_done_is_episode_end_only(self):
-        # F3: high-level done is 1 only on a true episode end, 0 on a c-boundary.
+    def test_manager_done_is_true_termination_only(self):
+        # F3 (corrected): high-level done = TRUE termination, NOT the flush trigger.
+        # 0 on a c-boundary, 0 on a horizon TRUNCATION (must still bootstrap), and
+        # 1 only on a genuine env termination (success).
         E, c = 1, 2
         agent, low, high, roll, sp = setup(E, c)
         roll.start(torch.randn(E, OBS))
-        self._step(roll, E, episode_end=False)   # step 1
-        self._step(roll, E, episode_end=False)    # step 2 -> c-boundary flush
-        assert high.done[0].item() == 0.0         # mid-episode boundary: not done
-        self._step(roll, E, episode_end=True)     # episode-end flush (seg_len=1)
-        assert high.done[1].item() == 1.0         # real terminal: done
+        self._step(roll, E, episode_end=False)                    # step 1
+        self._step(roll, E, episode_end=False)                    # step 2 -> c-boundary flush
+        assert high.done[0].item() == 0.0                         # mid-episode boundary: not done
+        # truncation: episode ends (flush) but it is NOT terminal -> manager bootstraps
+        self._step(roll, E, episode_end=True, terminal=False)     # truncation flush (seg_len=1)
+        assert high.done[1].item() == 0.0                         # truncation: NOT done
+        # genuine env termination (e.g. success) -> manager done
+        self._step(roll, E, episode_end=True, terminal=True)      # terminal flush
+        assert high.done[2].item() == 1.0                         # real terminal: done

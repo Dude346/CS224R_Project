@@ -60,6 +60,10 @@ class HIROConfig:
     use_phased_reward: bool = True      # grasp-gate the object subgoal dims in the worker reward
     pbrs_alpha: float = 0.1             # PBRS grasp potential strength (Φ = α·is_grasped);
                                         # was 0.5; calibrated to ~intrinsic reward magnitude
+    reach_coef: float = 1.0             # dense PRE-grasp hand→object reach term strength;
+                                        # the fix for the grasp-discovery deadlock (see
+                                        # subgoal_space.phased_pbrs_intrinsic_reward). 0 disables.
+    reach_temp: float = 5.0             # tanh sharpness of the reach term (1/units of subgoal space)
     hidden_dim: int = 256
     n_hidden: int = 3
     device: str = "cpu"
@@ -183,6 +187,7 @@ class HIROAgent:
         return self.sp.phased_pbrs_intrinsic_reward(
             s, g, s_next, is_grasped_s, is_grasped_s_next,
             gamma=self.cfg.gamma_low, alpha=self.cfg.pbrs_alpha,
+            reach_coef=self.cfg.reach_coef, reach_temp=self.cfg.reach_temp,
         )
 
     # ------------------------------------------------------------------

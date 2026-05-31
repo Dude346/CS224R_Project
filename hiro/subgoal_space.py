@@ -21,8 +21,22 @@ positions).
 
 Canonical spaces
 ----------------
-  PickCube-v1  : tcp_xyz + cube_xyz          (6 dims)
-  StackCube-v1 : tcp_xyz + cubeA_xyz + cubeB_xyz  (9 dims)
+Absolute (legacy):
+  PickCube-v1  : tcp_xyz + cube_xyz
+  StackCube-v1 : tcp_xyz + cubeA_xyz
+
+Hybrid (revised HIRO default):
+  PickCube-v1  : tcp_xyz + tcp_to_obj + obj_to_goal
+  StackCube-v1 : tcp_xyz + tcp_to_cubeA + cubeA_to_cubeB
+
+Object-centric:
+  PickCube-v1  : tcp_to_obj + obj_to_goal
+  StackCube-v1 : tcp_to_cubeA + cubeA_to_cubeB
+
+Latent object-centric:
+  Uses the same underlying geometric object-centric space as above, but the
+  manager/worker communicate through a learned low-dimensional latent code.
+  Reward and goal-transition math still happen in the geometric base space.
 
 The indices assume obs_mode="state" with pd_joint_delta_pos control and
 the standard Panda agent.  Run modal_verify_subgoal_space.py to confirm
@@ -168,6 +182,84 @@ class SubgoalSpace:
         pbrs = gamma * alpha * igs_next - alpha * igs
         return hand_term + igs * cube_term + pbrs
 
+    def phased_progress_pbrs_intrinsic_reward(
+        self,
+        s: torch.Tensor,                # (..., obs_dim)
+        g: torch.Tensor,                # (..., subgoal_dim) current residual-to-target at s
+        s_next: torch.Tensor,           # (..., obs_dim)
+        is_grasped_s: torch.Tensor,     # (...,)
+        is_grasped_s_next: torch.Tensor,  # (...,)
+        gamma: float,
+        alpha: float,
+        near_positions: Sequence[int],
+        near_threshold: float = 0.04,
+        stall_penalty: float = 0.05,
+        reach_coef: float = 1.0,
+        reach_temp: float = 10.0,
+        gripper_qpos_indices: Sequence[int] | None = None,
+        open_penalty_scale: float = 0.08,
+        max_open_aperture: float = 0.04,
+    ) -> torch.Tensor:
+        """Progress-shaped worker reward for object-centric PickCube.
+
+        Uses *progress* in the manager-conditioned residual rather than the
+        absolute next residual. This makes "hover near the cube" unattractive:
+        once progress stalls, the reward goes to ~0, and near-without-grasp is
+        further penalized by `stall_penalty`.
+
+        Reward:
+            hand_progress   = ||g_hand|| - ||g'_hand||
+            object_progress = ||g_obj || - ||g'_obj ||
+            pbrs            = γ·α·is_grasped(s') − α·is_grasped(s)
+            dense_reach     = c · (1 - tanh(t · ||tcp_to_obj(s')||))   [ungated]
+            open_penalty    = k · normalized_aperture(s')
+                              only when near the cube and not yet grasped
+
+            r = hand_progress
+              + dense_reach
+              + is_grasped(s) * object_progress
+              + pbrs
+              - stall_penalty * 1[ near(s') and not grasped(s') ]
+              - open_penalty
+
+        `near_positions` are positions within the projected subgoal state used
+        to define "near the cube". For PickCube object-centric this is simply
+        the tcp_to_obj block.
+        """
+        next_residual = self.subgoal_transition(s, g, s_next)
+        hand_now = torch.norm(g[..., self.hand_positions], dim=-1)
+        hand_next = torch.norm(next_residual[..., self.hand_positions], dim=-1)
+        hand_progress = hand_now - hand_next
+
+        if self.object_positions:
+            obj_now = torch.norm(g[..., self.object_positions], dim=-1)
+            obj_next = torch.norm(next_residual[..., self.object_positions], dim=-1)
+            object_progress = obj_now - obj_next
+        else:
+            object_progress = torch.zeros_like(hand_progress)
+
+        igs = is_grasped_s.to(hand_progress.dtype)
+        igs_next = is_grasped_s_next.to(hand_progress.dtype)
+        pbrs = gamma * alpha * igs_next - alpha * igs
+
+        projected_next = self.project(s_next)
+        near_dist = torch.norm(projected_next[..., list(near_positions)], dim=-1)
+        dense_reach = reach_coef * (1.0 - torch.tanh(reach_temp * near_dist))
+        hovering = (near_dist < near_threshold) & (~is_grasped_s_next.bool())
+        stall = hovering.to(hand_progress.dtype) * stall_penalty
+        open_penalty = torch.zeros_like(hand_progress)
+        if gripper_qpos_indices is not None:
+            aperture_next = s_next[..., list(gripper_qpos_indices)].mean(dim=-1)
+            open_fraction = torch.clamp(aperture_next / max_open_aperture, min=0.0, max=1.0)
+            open_when_near = hovering
+            open_penalty = (
+                open_when_near.to(hand_progress.dtype)
+                * open_penalty_scale
+                * open_fraction
+            )
+
+        return hand_progress + dense_reach + igs * object_progress + pbrs - stall - open_penalty
+
     def phased_intrinsic_reward(
         self,
         s: torch.Tensor,             # (..., obs_dim)
@@ -253,6 +345,78 @@ HIRO_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
     ),
 }
 
+OBJECT_CENTRIC_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
+    "PickCube-v1": SubgoalSpace(
+        indices=[36, 37, 38,   # tcp_to_obj_pos : extra.tcp_to_obj_pos
+                 39, 40, 41],  # obj_to_goal_pos: extra.obj_to_goal_pos
+        obs_dim=42,
+        label="tcp_to_obj+obj_to_goal",
+        object_dims=(3, 4, 5),  # obj_to_goal dims matter only once the cube is controlled
+    ),
+    "StackCube-v1": SubgoalSpace(
+        indices=[39, 40, 41,   # tcp_to_cubeA_pos : extra.tcp_to_cubeA_pos
+                 45, 46, 47],  # cubeA_to_cubeB_pos: extra.cubeA_to_cubeB_pos
+        obs_dim=48,
+        label="tcp_to_cubeA+cubeA_to_cubeB",
+        object_dims=(3, 4, 5),  # cubeA->cubeB placement dims are grasp-gated
+    ),
+}
+
+HYBRID_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
+    "PickCube-v1": SubgoalSpace(
+        indices=[19, 20, 21,   # tcp_xyz        : extra.tcp_pose[:3]
+                 36, 37, 38,   # tcp_to_obj_pos : extra.tcp_to_obj_pos
+                 39, 40, 41],  # obj_to_goal_pos: extra.obj_to_goal_pos
+        obs_dim=42,
+        label="tcp_xyz+tcp_to_obj+obj_to_goal",
+        object_dims=(6, 7, 8),  # only the object->goal transport dims are grasp-gated
+    ),
+    "StackCube-v1": SubgoalSpace(
+        indices=[18, 19, 20,   # tcp_xyz          : extra.tcp_pose[:3]
+                 39, 40, 41,   # tcp_to_cubeA_pos : extra.tcp_to_cubeA_pos
+                 45, 46, 47],  # cubeA_to_cubeB   : extra.cubeA_to_cubeB_pos
+        obs_dim=48,
+        label="tcp_xyz+tcp_to_cubeA+cubeA_to_cubeB",
+        object_dims=(6, 7, 8),  # placement/transport dims are grasp-gated
+    ),
+}
+
+SUBGOAL_SPACE_VARIANTS: dict[str, dict[str, SubgoalSpace]] = {
+    "absolute": HIRO_SUBGOAL_SPACES,
+    "hybrid": HYBRID_SUBGOAL_SPACES,
+    "object_centric": OBJECT_CENTRIC_SUBGOAL_SPACES,
+    "latent_object_centric": OBJECT_CENTRIC_SUBGOAL_SPACES,
+}
+
+
+def normalize_subgoal_variant(variant: str) -> str:
+    key = variant.strip().lower().replace("-", "_")
+    aliases = {
+        "default": "hybrid",
+        "abs": "absolute",
+        "absolute": "absolute",
+        "hybrid": "hybrid",
+        "hiro": "hybrid",
+        "revised_hiro": "hybrid",
+        "task_aligned": "hybrid",
+        "object": "object_centric",
+        "object_centric": "object_centric",
+        "objectcentric": "object_centric",
+        "obj": "object_centric",
+        "latent_object_centric": "latent_object_centric",
+        "latent_objectcentric": "latent_object_centric",
+        "latent-object-centric": "latent_object_centric",
+        "latent_obj": "latent_object_centric",
+        "stitch": "latent_object_centric",
+        "policy_stitching": "latent_object_centric",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"Unknown subgoal variant {variant!r}. "
+            f"Known variants: {sorted(set(aliases.values()))}"
+        )
+    return aliases[key]
+
 
 # ---------------------------------------------------------------------------
 # Grasp-state readers for the phased/PBRS worker reward.
@@ -302,11 +466,13 @@ def get_grasp_detector(env_id: str) -> "GraspReader | None":
     return GRASP_DETECTORS.get(env_id)
 
 
-def get_subgoal_space(env_id: str) -> SubgoalSpace:
-    """Return the canonical HIRO subgoal space for the given env."""
-    if env_id not in HIRO_SUBGOAL_SPACES:
+def get_subgoal_space(env_id: str, variant: str = "absolute") -> SubgoalSpace:
+    """Return the requested HIRO subgoal space for the given env."""
+    variant_key = normalize_subgoal_variant(variant)
+    spaces = SUBGOAL_SPACE_VARIANTS[variant_key]
+    if env_id not in spaces:
         raise ValueError(
-            f"No canonical subgoal space defined for {env_id!r}. "
-            f"Known envs: {list(HIRO_SUBGOAL_SPACES)}"
+            f"No {variant_key} subgoal space defined for {env_id!r}. "
+            f"Known envs: {list(spaces)}"
         )
-    return HIRO_SUBGOAL_SPACES[env_id]
+    return spaces[env_id]

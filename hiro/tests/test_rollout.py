@@ -253,12 +253,29 @@ class TestBoundaryFixes:
         assert low.next_subgoal[0, 0].shape == (SG,)
 
     def test_manager_done_is_episode_end_only(self):
-        # F3: high-level done is 1 only on a true episode end, 0 on a c-boundary.
+        # F3: high-level done follows the TRUE termination mask, not the flush
+        # trigger. c-boundaries and pure horizon truncations should bootstrap.
         E, c = 1, 2
         agent, low, high, roll, sp = setup(E, c)
         roll.start(torch.randn(E, OBS))
         self._step(roll, E, episode_end=False)   # step 1
         self._step(roll, E, episode_end=False)    # step 2 -> c-boundary flush
         assert high.done[0].item() == 0.0         # mid-episode boundary: not done
-        self._step(roll, E, episode_end=True)     # episode-end flush (seg_len=1)
-        assert high.done[1].item() == 1.0         # real terminal: done
+
+        # Pure truncation: flushes, but manager should still bootstrap.
+        obs = torch.randn(E, OBS)
+        nxt = torch.randn(E, OBS)
+        roll.record(
+            obs, torch.zeros(E, ACT), nxt, nxt, torch.zeros(E),
+            torch.tensor([True]), torch.zeros(E),
+        )
+        assert high.done[1].item() == 0.0
+
+        # True terminal: flushes and marks done.
+        obs = torch.randn(E, OBS)
+        nxt = torch.randn(E, OBS)
+        roll.record(
+            obs, torch.zeros(E, ACT), nxt, nxt, torch.zeros(E),
+            torch.tensor([True]), torch.ones(E),
+        )
+        assert high.done[2].item() == 1.0

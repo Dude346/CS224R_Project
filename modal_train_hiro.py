@@ -38,6 +38,7 @@ app = modal.App("train-hiro")
 )
 def train_hiro(
     env_id: str = "PickCube-v1",
+    subgoal_variant: str = "hybrid",
     robot_uids: str = "panda",
     control_mode: str = "pd_joint_delta_pos",
     seed: int = 1,
@@ -47,14 +48,15 @@ def train_hiro(
     learning_starts: int = 4_000,
     c: int = 10,
     subgoal_scale: float = 0.15,
-    gamma_low: float = 0.95,
+    gamma_low: float = 0.8,
     gamma_high: float = 0.8,
     low_buffer_size: int = 1_000_000,
     high_buffer_size: int = 200_000,
     use_off_policy_correction: bool = True,
     use_phased_reward: bool = True,
-    pbrs_alpha: float = 0.5,
-    partial_reset: bool = True,
+    pbrs_alpha: float = 0.1,
+    latent_subgoal_dim: int = 4,
+    partial_reset: bool = False,
     track: bool = False,
     capture_video: bool = True,
     exp_name: Optional[str] = None,
@@ -71,6 +73,7 @@ def train_hiro(
 
     args = TrainArgs(
         env_id=env_id,
+        subgoal_variant=subgoal_variant,
         robot_uids=robot_uids,
         control_mode=control_mode,
         seed=seed,
@@ -87,6 +90,7 @@ def train_hiro(
         use_off_policy_correction=use_off_policy_correction,
         use_phased_reward=use_phased_reward,
         pbrs_alpha=pbrs_alpha,
+        latent_subgoal_dim=latent_subgoal_dim,
         partial_reset=partial_reset,
         track=track,
         capture_video=capture_video,
@@ -133,6 +137,7 @@ def train_hiro(
 @app.local_entrypoint()
 def main(
     env_id: str = "PickCube-v1",
+    subgoal_variant: str = "hybrid",
     robot_uids: str = "panda",
     control_mode: str = "pd_joint_delta_pos",
     seed: int = 1,
@@ -145,11 +150,13 @@ def main(
     low_buffer_size: int = 100_000,
     high_buffer_size: int = 20_000,
     use_off_policy_correction: bool = True,
+    latent_subgoal_dim: int = 4,
     track: bool = False,
 ):
     """Foreground run. Defaults are SMOKE-sized; pass real sizes for a full run."""
     run_name, video_bytes = train_hiro.remote(
         env_id=env_id,
+        subgoal_variant=subgoal_variant,
         robot_uids=robot_uids,
         control_mode=control_mode,
         seed=seed,
@@ -162,6 +169,7 @@ def main(
         low_buffer_size=low_buffer_size,
         high_buffer_size=high_buffer_size,
         use_off_policy_correction=use_off_policy_correction,
+        latent_subgoal_dim=latent_subgoal_dim,
         track=track,
     )
     print(f"Training complete. Run name: {run_name}")
@@ -177,6 +185,7 @@ def main(
 @app.local_entrypoint()
 def launch(
     env_id: str = "PickCube-v1",
+    subgoal_variant: str = "hybrid",
     robot_uids: str = "panda",
     control_mode: str = "pd_joint_delta_pos",
     seed: int = 1,
@@ -184,11 +193,13 @@ def launch(
     c: int = 10,
     subgoal_scale: float = 0.15,
     use_off_policy_correction: bool = True,
+    latent_subgoal_dim: int = 4,
     track: bool = True,
 ):
     """Detached spawn for a full run."""
     fc = train_hiro.spawn(
         env_id=env_id,
+        subgoal_variant=subgoal_variant,
         robot_uids=robot_uids,
         control_mode=control_mode,
         seed=seed,
@@ -196,6 +207,7 @@ def launch(
         c=c,
         subgoal_scale=subgoal_scale,
         use_off_policy_correction=use_off_policy_correction,
+        latent_subgoal_dim=latent_subgoal_dim,
         track=track,
     )
     print(f"Spawned function call: {fc.object_id}")

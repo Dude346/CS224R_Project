@@ -29,19 +29,20 @@ import torch
 from hiro.hiro_agent import HIROAgent, HIROConfig
 from hiro.replay_buffer import HighLevelBuffer, LowLevelBuffer
 from hiro.rollout import HierarchicalRollout
-from hiro.subgoal_space import get_grasp_detector, get_subgoal_space
+from hiro.subgoal_space import get_grasp_detector, get_subgoal_space, normalize_subgoal_variant
 
 
 @dataclass
 class TrainArgs:
     env_id: str = "PickCube-v1"
+    subgoal_variant: str = "hybrid"
     robot_uids: str = "panda"
     control_mode: str = "pd_joint_delta_pos"
     seed: int = 1
     total_timesteps: int = 1_000_000
     num_envs: int = 32
     num_eval_envs: int = 16
-    num_eval_steps: int = 50
+    num_eval_steps: int = 200
     eval_freq: int = 50_000           # in env steps
     learning_starts: int = 4_000
     training_freq: int = 64           # env steps between update phases
@@ -52,15 +53,16 @@ class TrainArgs:
     # HIRO hyperparameters
     c: int = 10
     subgoal_scale: float = 0.15
-    gamma_low: float = 0.95
+    gamma_low: float = 0.8
     gamma_high: float = 0.8
     tau: float = 0.005
     use_phased_reward: bool = True
-    pbrs_alpha: float = 0.5            # PBRS grasp potential strength (replaces grasp_bonus)
+    pbrs_alpha: float = 0.1            # PBRS grasp potential strength (replaces grasp_bonus)
+    latent_subgoal_dim: int = 4        # only used by latent_object_centric
     # partial_reset=True: episodes end on TRUE termination (env success), not just
     # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
     # success). Flat SAC baselines used False to match upstream.
-    partial_reset: bool = True
+    partial_reset: bool = False
     policy_lr: float = 3e-4
     q_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -178,9 +180,10 @@ def train(args: TrainArgs) -> str:
     torch.manual_seed(args.seed)
 
     device = torch.device(args.device)
+    variant_key = normalize_subgoal_variant(args.subgoal_variant)
     run_name = args.exp_name or (
-        f"hiro_{args.env_id.replace('-', '_')}_{args.robot_uids}_"
-        f"{args.control_mode}_c{args.c}_seed{args.seed}_{args.total_timesteps}steps"
+        f"hiro_{args.env_id.replace('-', '_')}_{variant_key}_"
+        f"{args.robot_uids}_{args.control_mode}_c{args.c}_seed{args.seed}_{args.total_timesteps}steps"
     )
     run_dir = f"{args.output_root}/{run_name}"
     os.makedirs(run_dir, exist_ok=True)
@@ -191,8 +194,9 @@ def train(args: TrainArgs) -> str:
     low = np.asarray(envs.single_action_space.low).reshape(-1)
     high = np.asarray(envs.single_action_space.high).reshape(-1)
 
-    sp = get_subgoal_space(args.env_id)
+    sp = get_subgoal_space(args.env_id, variant_key)
     assert sp.obs_dim == obs_dim, f"subgoal space obs_dim {sp.obs_dim} != env obs_dim {obs_dim}"
+    latent_subgoal_dim = args.latent_subgoal_dim if variant_key == "latent_object_centric" else 0
 
     cfg = HIROConfig(
         action_dim=act_dim, c=args.c, subgoal_scale=args.subgoal_scale,
@@ -202,18 +206,20 @@ def train(args: TrainArgs) -> str:
         num_candidates=args.num_candidates,
         use_off_policy_correction=args.use_off_policy_correction,
         use_phased_reward=args.use_phased_reward, pbrs_alpha=args.pbrs_alpha,
+        latent_subgoal_dim=latent_subgoal_dim,
         device=args.device,
     )
     agent = HIROAgent(sp, cfg)
     if args.use_phased_reward:
         agent.grasp_detector = get_grasp_detector(args.env_id)
         print(f"phased worker reward (PBRS): detector={'set' if agent.grasp_detector else 'NONE'} "
+              f"| subgoal_variant={variant_key} "
               f"| object_dims={sp.object_positions} | pbrs_alpha={args.pbrs_alpha} "
               f"| gamma_low={args.gamma_low}")
 
-    low_buf = LowLevelBuffer(args.low_buffer_size, args.num_envs, obs_dim, sp.dim, act_dim,
+    low_buf = LowLevelBuffer(args.low_buffer_size, args.num_envs, obs_dim, agent.subgoal_dim, act_dim,
                              storage_device=args.buffer_device, sample_device=args.device)
-    high_buf = HighLevelBuffer(args.high_buffer_size, obs_dim, sp.dim, act_dim, args.c,
+    high_buf = HighLevelBuffer(args.high_buffer_size, obs_dim, agent.subgoal_dim, act_dim, args.c,
                                storage_device=args.buffer_device, sample_device=args.device)
     rollout = HierarchicalRollout(agent, low_buf, high_buf, args.num_envs, device=args.device)
 

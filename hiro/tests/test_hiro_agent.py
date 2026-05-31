@@ -20,7 +20,7 @@ import torch
 
 from hiro.hiro_agent import HIROAgent, HIROConfig
 from hiro.replay_buffer import HighLevelSample, LowLevelSample
-from hiro.subgoal_space import HIRO_SUBGOAL_SPACES
+from hiro.subgoal_space import HIRO_SUBGOAL_SPACES, OBJECT_CENTRIC_SUBGOAL_SPACES
 
 OBS, SG, ACT = 42, 6, 8          # PickCube-v1 HIRO subgoal space
 SCALE = 0.5
@@ -90,6 +90,129 @@ class TestActionSelection:
         g = ag.select_subgoal(torch.randn(16, OBS))
         assert g.shape == (16, SG)
         assert torch.all(g.abs() <= SCALE + 1e-6)
+
+
+class TestWorkerRewardSelection:
+    def test_object_centric_pickcube_uses_progress_reward_path(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(action_dim=ACT, c=5, subgoal_scale=SCALE, device="cpu")
+        ag = HIROAgent(sp, cfg)
+        ag.grasp_detector = lambda obs: obs[..., 18] > 0.5
+
+        s = torch.zeros(1, OBS)
+        s[:, 36] = 0.03  # already near the cube
+        g = torch.zeros(1, SG)
+        sn = s.clone()
+
+        r = ag.worker_reward(s, g, sn)
+        # No progress but hand parked on the object -> dense reach term should
+        # still make this positive, which is the intended "park and explore"
+        # behaviour from the branch fix.
+        assert r.shape == (1,)
+        assert r.item() > 0.0
+
+    def test_object_centric_pickcube_reduces_penalty_when_closing_near_cube(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(action_dim=ACT, c=5, subgoal_scale=SCALE, device="cpu")
+        ag = HIROAgent(sp, cfg)
+        ag.grasp_detector = lambda obs: obs[..., 18] > 0.5
+
+        s = torch.zeros(1, OBS)
+        s[:, 36] = 0.03
+        s[:, 7] = 0.04
+        s[:, 8] = 0.04
+        g = torch.zeros(1, SG)
+        sn = s.clone()
+        sn[:, 7] = 0.02
+        sn[:, 8] = 0.02
+        r_close = ag.worker_reward(s, g, sn)
+
+        sn_open = s.clone()
+        r_open = ag.worker_reward(s, g, sn_open)
+        assert r_close.shape == (1,)
+        assert r_close.item() > r_open.item()
+
+
+class TestLatentInterface:
+    def test_latent_object_centric_interface_has_requested_dim(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(
+            action_dim=ACT,
+            c=5,
+            subgoal_scale=SCALE,
+            latent_subgoal_dim=4,
+            latent_pretrain_steps=5,
+            latent_pretrain_batch_size=32,
+            device="cpu",
+        )
+        ag = HIROAgent(sp, cfg)
+        assert ag.latent_enabled is True
+        assert ag.subgoal_dim == 4
+
+    def test_latent_transition_roundtrip_shape(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(
+            action_dim=ACT,
+            c=5,
+            subgoal_scale=SCALE,
+            latent_subgoal_dim=4,
+            latent_pretrain_steps=5,
+            latent_pretrain_batch_size=32,
+            device="cpu",
+        )
+        ag = HIROAgent(sp, cfg)
+        obs = torch.randn(3, OBS)
+        z = ag.select_subgoal(obs)
+        next_obs = torch.randn(3, OBS)
+        z_next = ag.subgoal_transition(obs, z, next_obs)
+        assert z.shape == (3, 4)
+        assert z_next.shape == (3, 4)
+
+    def test_latent_worker_reward_decodes_geometric_goal(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(
+            action_dim=ACT,
+            c=5,
+            subgoal_scale=SCALE,
+            latent_subgoal_dim=4,
+            latent_pretrain_steps=5,
+            latent_pretrain_batch_size=32,
+            device="cpu",
+        )
+        ag = HIROAgent(sp, cfg)
+        ag.grasp_detector = lambda obs: obs[..., 18] > 0.5
+        s = torch.zeros(2, OBS)
+        z = ag.select_subgoal(s)
+        s_next = torch.zeros(2, OBS)
+        r = ag.worker_reward(s, z, s_next)
+        assert r.shape == (2,)
+
+    def test_latent_off_policy_correction_returns_latent_shape(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        latent_dim = 4
+        cfg = HIROConfig(
+            action_dim=ACT,
+            c=5,
+            subgoal_scale=SCALE,
+            latent_subgoal_dim=latent_dim,
+            latent_pretrain_steps=5,
+            latent_pretrain_batch_size=32,
+            device="cpu",
+        )
+        ag = HIROAgent(sp, cfg)
+        batch = HighLevelSample(
+            s0=torch.randn(8, OBS),
+            g0=(torch.rand(8, latent_dim) * 2 - 1) * 0.9,
+            reward_sum=torch.randn(8),
+            s_c=torch.randn(8, OBS),
+            done=torch.zeros(8),
+            inter_obs=torch.randn(8, 5, OBS),
+            inter_act=torch.rand(8, 5, ACT) * 2 - 1,
+            inter_len=torch.full((8,), 5, dtype=torch.long),
+        )
+        g = ag.off_policy_correct(batch)
+        assert g.shape == (8, latent_dim)
+        assert torch.all(torch.isfinite(g))
 
 
 # ---------------------------------------------------------------------------

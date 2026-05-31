@@ -24,7 +24,8 @@ Per-step ordering (the bug-prone part), implemented in `record`:
   5. seg_reward += r_env;  seg_len += 1
   6. flush = (seg_len >= c) OR episode_end
   7. for flushing envs: push (s0, g0, seg_reward, s_c=s', intermediates, seg_len)
-     to high_buffer, then sample a fresh subgoal and reset segment state
+     to high_buffer with a manager done mask based on TRUE terminations only,
+     then sample a fresh subgoal and reset segment state
   8. non-flushing envs: cur_subgoal <- g_next
 
 Two different "next obs" must be passed in:
@@ -51,7 +52,7 @@ class HierarchicalRollout:
         self.device = torch.device(device)
 
         self.obs_dim = agent.sp.obs_dim
-        self.sg_dim = agent.sp.dim
+        self.sg_dim = agent.subgoal_dim
         self.act_dim = agent.cfg.action_dim
 
         E, c, dev = num_envs, self.c, self.device
@@ -83,7 +84,7 @@ class HierarchicalRollout:
         resample_obs: torch.Tensor,   # (E, obs)  obs to start the next segment from
         r_env: torch.Tensor,          # (E,)      env reward
         episode_end: torch.Tensor,    # (E,) bool episode ended this step (flush trigger)
-        bootstrap_done: torch.Tensor, # (E,)      SAC done/bootstrap mask stored in buffers
+        bootstrap_done: torch.Tensor, # (E,)      TRUE termination mask used by both worker+manager critics
     ) -> torch.Tensor:
         """Process one vectorized transition; returns the updated cur_subgoal."""
         E, c = self.E, self.c
@@ -110,15 +111,15 @@ class HierarchicalRollout:
         idx = flush.nonzero(as_tuple=True)[0]
 
         # 5: flush completed segments to the high-level buffer (BEFORE resetting them).
-        #    The manager's done is the TRUE episode end (a c-boundary mid-episode is
-        #    NOT terminal for the manager — it has a successor segment to bootstrap).
+        #    The manager's done is the TRUE termination mask, not the flush trigger:
+        #    c-boundaries and pure horizon truncations should still bootstrap Q(s_c).
         if idx.numel() > 0:
             self.high.add_batch(
                 self.seg_start_obs[idx],
                 self.seg_subgoal[idx],
                 self.seg_reward[idx],
                 real_next_obs[idx],          # s_c = terminal obs of the segment
-                episode_end[idx].float(),    # F3: manager done = real episode end
+                bootstrap_done[idx].float(), # F3: manager done = true termination only
                 self.seg_obs[idx],
                 self.seg_act[idx],
                 self.seg_len[idx],

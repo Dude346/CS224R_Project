@@ -20,11 +20,14 @@ import torch
 
 from hiro.subgoal_space import (
     GRASP_DETECTORS,
+    HYBRID_SUBGOAL_SPACES,
     HIRO_SUBGOAL_SPACES,
+    OBJECT_CENTRIC_SUBGOAL_SPACES,
     ObsBitGraspReader,
     PositionalGraspDetector,
     SubgoalSpace,
     get_subgoal_space,
+    normalize_subgoal_variant,
 )
 
 # ---------------------------------------------------------------------------
@@ -70,9 +73,64 @@ class TestConstruction:
         # reward (the same pathology that blocked the early HIRO runs).
         assert HIRO_SUBGOAL_SPACES["StackCube-v1"].dim == 6
 
+    def test_object_centric_pickcube_dim(self):
+        assert OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"].dim == 6
+
+    def test_object_centric_stackcube_dim(self):
+        assert OBJECT_CENTRIC_SUBGOAL_SPACES["StackCube-v1"].dim == 6
+
+    def test_hybrid_pickcube_dim(self):
+        assert HYBRID_SUBGOAL_SPACES["PickCube-v1"].dim == 9
+
+    def test_hybrid_stackcube_dim(self):
+        assert HYBRID_SUBGOAL_SPACES["StackCube-v1"].dim == 9
+
     def test_get_subgoal_space_unknown_raises(self):
         with pytest.raises(ValueError):
             get_subgoal_space("UnknownEnv-v1")
+
+    def test_get_object_centric_pickcube_space(self):
+        sp = get_subgoal_space("PickCube-v1", "object_centric")
+        assert sp.indices == [36, 37, 38, 39, 40, 41]
+        assert sp.label == "tcp_to_obj+obj_to_goal"
+        assert sp.object_positions == [3, 4, 5]
+
+    def test_get_object_centric_stackcube_space(self):
+        sp = get_subgoal_space("StackCube-v1", "object-centric")
+        assert sp.indices == [39, 40, 41, 45, 46, 47]
+        assert sp.label == "tcp_to_cubeA+cubeA_to_cubeB"
+        assert sp.object_positions == [3, 4, 5]
+
+    def test_get_hybrid_pickcube_space(self):
+        sp = get_subgoal_space("PickCube-v1", "hybrid")
+        assert sp.indices == [19, 20, 21, 36, 37, 38, 39, 40, 41]
+        assert sp.label == "tcp_xyz+tcp_to_obj+obj_to_goal"
+        assert sp.object_positions == [6, 7, 8]
+
+    def test_get_hybrid_stackcube_space(self):
+        sp = get_subgoal_space("StackCube-v1", "hiro")
+        assert sp.indices == [18, 19, 20, 39, 40, 41, 45, 46, 47]
+        assert sp.label == "tcp_xyz+tcp_to_cubeA+cubeA_to_cubeB"
+        assert sp.object_positions == [6, 7, 8]
+
+    def test_get_latent_object_centric_pickcube_space(self):
+        sp = get_subgoal_space("PickCube-v1", "latent_object_centric")
+        assert sp.indices == [36, 37, 38, 39, 40, 41]
+        assert sp.label == "tcp_to_obj+obj_to_goal"
+        assert sp.object_positions == [3, 4, 5]
+
+    def test_normalize_subgoal_variant_aliases(self):
+        assert normalize_subgoal_variant("default") == "hybrid"
+        assert normalize_subgoal_variant("absolute") == "absolute"
+        assert normalize_subgoal_variant("hiro") == "hybrid"
+        assert normalize_subgoal_variant("object-centric") == "object_centric"
+        assert normalize_subgoal_variant("obj") == "object_centric"
+        assert normalize_subgoal_variant("latent-object-centric") == "latent_object_centric"
+        assert normalize_subgoal_variant("stitch") == "latent_object_centric"
+
+    def test_normalize_subgoal_variant_unknown_raises(self):
+        with pytest.raises(ValueError):
+            normalize_subgoal_variant("weird")
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +456,142 @@ class TestPBRSReward:
             -self.ALPHA,
         ])
         assert torch.allclose(r, expected)
+
+
+class TestProgressPBRSReward:
+    GAMMA = 0.95
+    ALPHA = 0.5
+
+    @pytest.fixture
+    def psp(self) -> SubgoalSpace:
+        return SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=4, object_dims=(2, 3))
+
+    def test_dense_reach_prefers_near_over_far(self, psp):
+        s = torch.zeros(4)
+        g = torch.zeros(4)
+        sn_near = torch.tensor([0.03, 0.0, 0.0, 0.0])
+        sn_far = torch.tensor([0.30, 0.0, 0.0, 0.0])
+        r_near = psp.phased_progress_pbrs_intrinsic_reward(
+            s, g, sn_near,
+            torch.tensor(0.0), torch.tensor(0.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
+            reach_coef=1.0, reach_temp=10.0,
+        )
+        r_far = psp.phased_progress_pbrs_intrinsic_reward(
+            s, g, sn_far,
+            torch.tensor(0.0), torch.tensor(0.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
+            reach_coef=1.0, reach_temp=10.0,
+        )
+        assert r_near.item() > r_far.item()
+
+    def test_grasp_bonus_survives_progress_reward(self, psp):
+        s = torch.zeros(4)
+        g = torch.tensor([0.02, 0.0, 0.0, 1.0])
+        sn = torch.tensor([0.02, 0.0, 0.0, 0.0])
+        r = psp.phased_progress_pbrs_intrinsic_reward(
+            s, g, sn,
+            torch.tensor(0.0), torch.tensor(1.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            near_positions=(0, 1), near_threshold=0.06, stall_penalty=0.05,
+        )
+        assert r.item() > 0.0
+
+    def test_dense_reach_persists_post_grasp(self, psp):
+        s = torch.zeros(4)
+        g = torch.zeros(4)
+        sn = torch.tensor([0.02, 0.0, 0.0, 0.0])
+        r_free = psp.phased_progress_pbrs_intrinsic_reward(
+            s, g, sn,
+            torch.tensor(0.0), torch.tensor(0.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
+            reach_coef=1.0, reach_temp=10.0,
+        )
+        r_hold = psp.phased_progress_pbrs_intrinsic_reward(
+            s, g, sn,
+            torch.tensor(1.0), torch.tensor(1.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
+            reach_coef=1.0, reach_temp=10.0,
+        )
+        assert r_free.item() > 0.0
+        assert r_hold.item() > 0.0
+        assert r_hold.item() == pytest.approx(
+            r_free.item() + 0.05 + self.ALPHA * (self.GAMMA - 1.0), abs=1e-6
+        )
+
+    def test_near_closing_reduces_open_penalty(self):
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=10, object_dims=(2, 3))
+        s = torch.zeros(10)
+        s[0] = 0.03            # near the cube
+        s[7] = 0.04            # open fingers
+        s[8] = 0.04
+        g = torch.zeros(4)
+
+        sn_close = s.clone()
+        sn_close[7] = 0.02     # fingers closed some amount
+        sn_close[8] = 0.02
+        r_close = sp.phased_progress_pbrs_intrinsic_reward(
+            s, g, sn_close,
+            torch.tensor(0.0), torch.tensor(0.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
+            gripper_qpos_indices=(7, 8), open_penalty_scale=0.08, max_open_aperture=0.04,
+        )
+
+        sn_hold = s.clone()
+        r_hold = sp.phased_progress_pbrs_intrinsic_reward(
+            s, g, sn_hold,
+            torch.tensor(0.0), torch.tensor(0.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
+            gripper_qpos_indices=(7, 8), open_penalty_scale=0.08, max_open_aperture=0.04,
+        )
+        assert r_close.item() > r_hold.item()
+
+    def test_far_closing_does_not_change_reward(self):
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=10, object_dims=(2, 3))
+        s = torch.zeros(10)
+        s[0] = 0.20            # far from cube
+        s[7] = 0.04
+        s[8] = 0.04
+        g = torch.zeros(4)
+        sn_close = s.clone()
+        sn_close[7] = 0.02
+        sn_close[8] = 0.02
+        r_close = sp.phased_progress_pbrs_intrinsic_reward(
+            s, g, sn_close,
+            torch.tensor(0.0), torch.tensor(0.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
+            gripper_qpos_indices=(7, 8), open_penalty_scale=0.08, max_open_aperture=0.04,
+        )
+        sn_open = s.clone()
+        r_open = sp.phased_progress_pbrs_intrinsic_reward(
+            s, g, sn_open,
+            torch.tensor(0.0), torch.tensor(0.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
+            gripper_qpos_indices=(7, 8), open_penalty_scale=0.08, max_open_aperture=0.04,
+        )
+        assert r_close.item() == pytest.approx(r_open.item(), abs=1e-6)
+
+    def test_sustained_grasp_has_only_pbrs_hold_tax(self):
+        psp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=4, object_dims=(2, 3))
+        s = torch.zeros(4)
+        g = torch.zeros(4)
+        sn = torch.zeros(4)
+        r = psp.phased_progress_pbrs_intrinsic_reward(
+            s, g, sn,
+            torch.tensor(1.0), torch.tensor(1.0),
+            gamma=self.GAMMA, alpha=self.ALPHA,
+            near_positions=(0, 1), near_threshold=0.04, stall_penalty=0.05,
+        )
+        expected_reach = 1.0 - math.tanh(0.0)
+        assert r.item() == pytest.approx(expected_reach + self.ALPHA * (self.GAMMA - 1.0), abs=1e-6)
 
 
 # ---------------------------------------------------------------------------

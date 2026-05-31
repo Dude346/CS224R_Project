@@ -228,11 +228,12 @@ class TestPBRSGradientFlow:
         ag.grasp_detector = GRASP_DETECTORS["PickCube-v1"]
 
         B = 32
-        # Construct B transitions where every one is a true F -> T grasp.
+        # Construct B transitions that are a true F -> T grasp, via the env grasp
+        # bit obs[18] (ObsBitGraspReader): not grasped at s, grasped at s_next.
         s = torch.zeros(B, OBS)
         s_next = torch.zeros(B, OBS)
-        s[:, 36:39] = torch.tensor([0.2, 0.0, 0.0]);    s[:, 31] = 0.02
-        s_next[:, 36:39] = torch.tensor([0.01, 0.0, 0.0]); s_next[:, 31] = 0.10
+        s[:, 18] = 0.0      # not grasped at s
+        s_next[:, 18] = 1.0  # grasped at s_next
         g = torch.zeros(B, SG)
 
         r = ag.worker_reward(s, g, s_next)

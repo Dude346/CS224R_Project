@@ -16,7 +16,7 @@ from hiro.subgoal_space import GRASP_DETECTORS
 SCALE = 0.15
 
 
-def _build_pickcube_obs(B, tcp_xyz, cube_xyz, goal_xyz, cube_z=None):
+def _build_pickcube_obs(B, tcp_xyz, cube_xyz, goal_xyz, cube_z=None, is_grasped=False):
     """Make a synthetic PickCube obs with controlled positions."""
     obs = torch.zeros(B, 42)
     obs[:, 19:22] = torch.tensor(tcp_xyz)
@@ -24,8 +24,11 @@ def _build_pickcube_obs(B, tcp_xyz, cube_xyz, goal_xyz, cube_z=None):
     obs[:, 26:29] = torch.tensor(goal_xyz)
     if cube_z is not None:
         obs[:, 31] = cube_z
-    # set tcp_to_obj = cube - tcp so the grasp detector reads correctly
+    # set tcp_to_obj = cube - tcp (used by the positional detector / oracle geometry)
     obs[:, 36:39] = obs[:, 29:32] - obs[:, 19:22]
+    # PickCube grasp detection now reads the TRUE env grasp bit at obs[18].
+    if is_grasped:
+        obs[:, 18] = 1.0
     return obs
 
 
@@ -50,14 +53,14 @@ class TestPickCubeOracle:
         det = GRASP_DETECTORS["PickCube-v1"]
         oracle = make_oracle("PickCube-v1", SCALE, det)
 
-        # gripper AT cube (close) AND cube lifted (z>0.035) => is_grasped = True
+        # is_grasped = True via the TRUE env grasp bit obs[18] (ObsBitGraspReader).
         # cube at (0.1, 0, 0.10); goal at (0.20, 0, 0.20)
         obs = torch.zeros(1, 42)
         obs[0, 19:22] = torch.tensor([0.10, 0.0, 0.10])
         obs[0, 29:32] = torch.tensor([0.10, 0.0, 0.10])
         obs[0, 26:29] = torch.tensor([0.20, 0.0, 0.20])
-        obs[0, 36:39] = obs[0, 29:32] - obs[0, 19:22]   # zero distance => close
-        obs[0, 31] = 0.10                                # lifted
+        obs[0, 36:39] = obs[0, 29:32] - obs[0, 19:22]   # TCP at cube
+        obs[0, 18] = 1.0                                 # true grasp bit set
         assert bool(det(obs)[0]) is True
 
         g = oracle(obs)

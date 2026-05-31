@@ -20,8 +20,9 @@ import torch
 
 from hiro.subgoal_space import (
     GRASP_DETECTORS,
-    GraspDetector,
     HIRO_SUBGOAL_SPACES,
+    ObsBitGraspReader,
+    PositionalGraspDetector,
     SubgoalSpace,
     get_subgoal_space,
 )
@@ -400,27 +401,42 @@ class TestPBRSReward:
 
 
 # ---------------------------------------------------------------------------
-# Embodiment-independent grasp detector
+# Grasp-state readers
 # ---------------------------------------------------------------------------
 
-class TestGraspDetector:
-    def test_pickcube_detects_near_and_lifted(self):
+class TestGraspReaders:
+    def test_pickcube_uses_true_obs_bit(self):
         det = GRASP_DETECTORS["PickCube-v1"]
         obs = torch.zeros(3, 42)
-        # env0: gripper at cube AND cube lifted -> grasped
-        obs[0, 36:39] = torch.tensor([0.01, 0.0, 0.0]); obs[0, 31] = 0.10
-        # env1: gripper at cube but cube on the table (not lifted) -> not grasped
-        obs[1, 36:39] = torch.tensor([0.01, 0.0, 0.0]); obs[1, 31] = 0.02
-        # env2: cube lifted but gripper far away -> not grasped
-        obs[2, 36:39] = torch.tensor([0.30, 0.0, 0.0]); obs[2, 31] = 0.10
+        # env0: true is_grasped bit on -> grasped, regardless of geometry fields
+        obs[0, 18] = 1.0
+        obs[0, 36:39] = torch.tensor([0.30, 0.0, 0.0]); obs[0, 31] = 0.02
+        # env1: bit off -> not grasped, even if heuristic geometry would say yes
+        obs[1, 18] = 0.0
+        obs[1, 36:39] = torch.tensor([0.01, 0.0, 0.0]); obs[1, 31] = 0.10
+        # env2: thresholded bit still off
+        obs[2, 18] = 0.49
         g = det(obs)
         assert bool(g[0]) is True
         assert bool(g[1]) is False
         assert bool(g[2]) is False
 
-    def test_detector_is_force_free(self):
-        # Detector reads only positions, so identical obs -> identical result
-        # regardless of any (absent) force fields => same across embodiments.
-        det = GraspDetector(tcp_to_obj_indices=(0, 1, 2), obj_z_index=3, near_threshold=0.05, lift_threshold=0.035)
+    def test_stackcube_detector_is_force_free(self):
+        # StackCube still uses the positional heuristic, so identical obs ->
+        # identical result regardless of any (absent) force fields.
+        det = PositionalGraspDetector(
+            tcp_to_obj_indices=(0, 1, 2), obj_z_index=3,
+            near_threshold=0.05, lift_threshold=0.035,
+        )
         obs = torch.tensor([[0.0, 0.0, 0.0, 0.10]])   # at object, lifted
         assert bool(det(obs)[0]) is True
+
+    def test_obs_bit_reader_thresholds(self):
+        det = ObsBitGraspReader(obs_index=2, threshold=0.5)
+        obs = torch.tensor([
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.5],
+            [0.0, 0.0, 1.0],
+        ])
+        g = det(obs)
+        assert torch.equal(g, torch.tensor([False, False, True]))

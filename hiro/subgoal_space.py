@@ -192,7 +192,10 @@ class SubgoalSpace:
         reach_coef: float = 1.0,
         grasp_coef: float = 1.0,
         place_coef: float = 1.0,
+        object_progress_coef: float = 2.0,
         tanh_temp: float = 5.0,
+        settle_coef: float = 0.5,
+        static_temp: float = 0.25,
     ) -> torch.Tensor:
         """Farming-proof worker reward for object-centric PickCube.
 
@@ -214,12 +217,18 @@ class SubgoalSpace:
 
             Φ(x) = reach_coef · (1 − tanh(k·‖tcp_to_obj(x)‖))
                  + grasp_coef · is_grasped(x)
-                 + place_coef · is_grasped(x) · (1 − tanh(k·‖obj_to_goal(x)‖))
+                 + place_coef · is_grasped(x) · place_score(x)
+                 + settle_coef · is_grasped(x) · place_score(x) · static(x)
+
+        where:
+            place_score(x) = 1 − tanh(k·‖obj_to_goal(x)‖)
+            static(x)      = 1 − tanh(k_v·‖qvel(x)‖)
 
         Reward:
             r = Φ(s') − Φ(s)                               # task shaping (γ=1 telescope)
               + (‖g_hand‖ − ‖g'_hand‖)                     # follow the manager hand target
-              + is_grasped(s) · (‖g_obj‖ − ‖g'_obj‖)       # follow the manager place target
+              + is_grasped(s) · object_progress_coef ·
+                (‖g_obj‖ − ‖g'_obj‖)                       # follow the manager place target
 
         Φ is maximised at success (gripper on cube, grasped, cube at goal), so
         climbing Φ solves the task; holding static costs 0; *leaving* a high-Φ
@@ -239,16 +248,22 @@ class SubgoalSpace:
         igs = is_grasped_s.to(s.dtype)
         igs_next = is_grasped_s_next.to(s.dtype)
 
-        def _potential(proj: torch.Tensor, grasp: torch.Tensor) -> torch.Tensor:
+        def _potential(obs: torch.Tensor, proj: torch.Tensor, grasp: torch.Tensor) -> torch.Tensor:
             reach_dist = torch.norm(proj[..., self.hand_positions], dim=-1)
             phi = reach_coef * (1.0 - torch.tanh(tanh_temp * reach_dist))
             phi = phi + grasp_coef * grasp
             if self.object_positions:
                 place_dist = torch.norm(proj[..., self.object_positions], dim=-1)
-                phi = phi + place_coef * grasp * (1.0 - torch.tanh(tanh_temp * place_dist))
+                place_score = 1.0 - torch.tanh(tanh_temp * place_dist)
+                phi = phi + place_coef * grasp * place_score
+                qvel = proj.new_zeros(place_dist.shape)
+                if obs.shape[-1] >= 18:
+                    qvel = torch.norm(obs[..., 9:18], dim=-1)
+                static_score = 1.0 - torch.tanh(static_temp * qvel)
+                phi = phi + settle_coef * grasp * place_score * static_score
             return phi
 
-        task_shaping = _potential(proj_sn, igs_next) - _potential(proj_s, igs)
+        task_shaping = _potential(s_next, proj_sn, igs_next) - _potential(s, proj_s, igs)
 
         hand_now = torch.norm(g[..., self.hand_positions], dim=-1)
         hand_next = torch.norm(next_residual[..., self.hand_positions], dim=-1)
@@ -261,7 +276,11 @@ class SubgoalSpace:
         else:
             object_progress = torch.zeros_like(hand_progress)
 
-        return task_shaping + hand_progress + igs * object_progress
+        return (
+            task_shaping
+            + hand_progress
+            + igs * object_progress_coef * object_progress
+        )
 
     def phased_intrinsic_reward(
         self,

@@ -474,9 +474,9 @@ class TestTaskPotentialReward:
         # dims 0,1 = tcp_to_obj (hand); dims 2,3 = obj_to_goal (object)
         return SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=4, object_dims=(2, 3))
 
-    def _r(self, psp, s, g, sn, gs, gsn):
+    def _r(self, psp, s, g, sn, gs, gsn, **kwargs):
         return psp.task_potential_intrinsic_reward(
-            s, g, sn, torch.tensor(gs), torch.tensor(gsn)
+            s, g, sn, torch.tensor(gs), torch.tensor(gsn), **kwargs
         ).item()
 
     def test_lifting_beats_holding_post_grasp(self, psp):
@@ -491,6 +491,14 @@ class TestTaskPotentialReward:
         r_lift = self._r(psp, s, g, sn_lift, 1.0, 1.0)
         assert r_lift > r_hold
         assert r_hold == pytest.approx(0.0, abs=1e-6)    # no hold tax
+
+    def test_post_grasp_object_progress_can_be_upweighted(self, psp):
+        s = torch.tensor([0.0, 0.0, 0.20, 0.0])
+        g = torch.tensor([0.0, 0.0, -0.20, 0.0])
+        sn = torch.tensor([0.0, 0.0, 0.10, 0.0])
+        r_base = self._r(psp, s, g, sn, 1.0, 1.0, object_progress_coef=1.0)
+        r_up = self._r(psp, s, g, sn, 1.0, 1.0, object_progress_coef=2.0)
+        assert r_up > r_base
 
     def test_static_hold_pays_zero(self, psp):
         """No state change + zero subgoal residual delta => exactly 0 (cannot be
@@ -543,6 +551,44 @@ class TestTaskPotentialReward:
         r = psp.task_potential_intrinsic_reward(s, g, sn, gs, gs)
         assert r.shape == (7,)
         assert torch.all(torch.isfinite(r))
+
+    def test_tiny_post_grasp_corrections_still_pay_smoothly(self):
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3))
+        s = torch.zeros(18)
+        sn = torch.zeros(18)
+        s[2] = 0.014
+        sn[2] = 0.010
+        r = sp.task_potential_intrinsic_reward(
+            s, torch.zeros(4), sn, torch.tensor(1.0), torch.tensor(1.0)
+        )
+        assert r.item() > 0.0
+
+    def test_near_goal_slowing_down_is_rewarded(self):
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3))
+        s = torch.zeros(18)
+        sn = torch.zeros(18)
+        s[2] = 0.010
+        sn[2] = 0.010
+        s[9:18] = 1.0
+        r = sp.task_potential_intrinsic_reward(
+            s, torch.zeros(4), sn, torch.tensor(1.0), torch.tensor(1.0)
+        )
+        assert r.item() > 0.0
+
+    def test_near_goal_low_qvel_beats_high_qvel(self):
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3))
+        s = torch.zeros(18)
+        s[2] = 0.010
+        sn_fast = s.clone()
+        sn_slow = s.clone()
+        sn_fast[9:18] = 1.0
+        r_fast = sp.task_potential_intrinsic_reward(
+            s, torch.zeros(4), sn_fast, torch.tensor(1.0), torch.tensor(1.0)
+        )
+        r_slow = sp.task_potential_intrinsic_reward(
+            s, torch.zeros(4), sn_slow, torch.tensor(1.0), torch.tensor(1.0)
+        )
+        assert r_slow.item() > r_fast.item()
 
 
 # ---------------------------------------------------------------------------

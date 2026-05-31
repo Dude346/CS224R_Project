@@ -49,7 +49,7 @@ def train_hiro(
     c: int = 10,
     subgoal_scale: float = 0.15,
     gamma_low: float = 0.8,
-    gamma_high: float = 0.8,
+    gamma_high: float = 0.97,
     low_buffer_size: int = 1_000_000,
     high_buffer_size: int = 200_000,
     use_off_policy_correction: bool = True,

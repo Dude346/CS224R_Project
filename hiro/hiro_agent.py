@@ -48,7 +48,7 @@ class HIROConfig:
     action_low: float = -1.0
     action_high: float = 1.0
     gamma_low: float = 0.8
-    gamma_high: float = 0.8             # bounded manager value (avoids Q divergence)
+    gamma_high: float = 0.97            # longer-horizon manager for transport stability
     tau: float = 0.005                  # soft target update rate
     max_grad_norm: float = 10.0         # critic/actor grad clip; 0 disables
     policy_lr: float = 3e-4
@@ -255,7 +255,8 @@ class HIROAgent:
         if self.sp.obs_dim == 42 and self.sp.indices == [36, 37, 38, 39, 40, 41]:
             return self.sp.task_potential_intrinsic_reward(
                 s, g_base, s_next, is_grasped_s, is_grasped_s_next,
-                reach_coef=1.0, grasp_coef=1.0, place_coef=1.0, tanh_temp=5.0,
+                reach_coef=1.0, grasp_coef=1.0, place_coef=1.0,
+                object_progress_coef=2.0, tanh_temp=5.0,
             )
         return self.sp.phased_pbrs_intrinsic_reward(
             s, g_base, s_next, is_grasped_s, is_grasped_s_next,

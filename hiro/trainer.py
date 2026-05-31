@@ -54,7 +54,7 @@ class TrainArgs:
     c: int = 10
     subgoal_scale: float = 0.15
     gamma_low: float = 0.8
-    gamma_high: float = 0.8
+    gamma_high: float = 0.97
     tau: float = 0.005
     use_phased_reward: bool = True
     pbrs_alpha: float = 0.1            # PBRS grasp potential strength (replaces grasp_bonus)

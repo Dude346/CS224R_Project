@@ -91,8 +91,9 @@ class HierarchicalRollout:
         episode_end = episode_end.bool()
 
         # 1: worker reward + telescoped subgoal, both using the CURRENT subgoal.
-        #    worker_reward is phase-aware (grasp-gated) when a detector is set.
-        r_lo = self.agent.worker_reward(obs, self.cur_subgoal, real_next_obs)
+        #    worker_reward is phase-aware (grasp-gated) when a detector is set, and
+        #    blends in env reward when worker_extrinsic_weight > 0 (hybrid).
+        r_lo = self.agent.worker_reward(obs, self.cur_subgoal, real_next_obs, r_env)
         g_next = self.agent.subgoal_transition(obs, self.cur_subgoal, real_next_obs)
 
         # 2: record the intermediate (s_i, a_i) at the current segment position.

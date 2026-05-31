@@ -29,6 +29,7 @@ import torch
 from hiro.hiro_agent import HIROAgent, HIROConfig
 from hiro.replay_buffer import HighLevelBuffer, LowLevelBuffer
 from hiro.rollout import HierarchicalRollout
+from hiro.oracle import make_oracle
 from hiro.subgoal_space import get_grasp_detector, get_subgoal_space
 
 
@@ -57,6 +58,12 @@ class TrainArgs:
     tau: float = 0.005
     use_phased_reward: bool = True
     pbrs_alpha: float = 0.5            # PBRS grasp potential strength (replaces grasp_bonus)
+    worker_extrinsic_weight: float = 0.0  # hybrid: r_worker = (1-w)*intrinsic + w*env_reward
+    # Diagnostic mode: replace the manager with a hardcoded oracle that reads the
+    # cube/goal positions from obs. Only the WORKER trains. Tests whether the
+    # worker SAC can solve the task given perfect subgoals (isolates worker bugs
+    # from manager/cold-start issues).
+    oracle_manager: bool = False
     # partial_reset=True: episodes end on TRUE termination (env success), not just
     # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
     # success). Flat SAC baselines used False to match upstream.
@@ -142,10 +149,21 @@ def evaluate(agent: HIROAgent, eval_envs, args: TrainArgs) -> dict:
     steps_since = torch.zeros(E, dtype=torch.long, device=device)
 
     metrics = defaultdict(list)
+    # Grasp diagnostics over the GREEDY eval rollout (far more informative than the
+    # buffer-wide grasp_rate, which is swamped by random exploration transitions).
+    grasp_step_count = 0
+    grasp_step_total = 0
+    ever_grasped = torch.zeros(E, dtype=torch.bool, device=device)
     for _ in range(args.num_eval_steps):
         action = agent.select_action(obs, cur_g, deterministic=True)
         prev_obs = obs
         obs, _, terminations, truncations, infos = eval_envs.step(action)
+
+        if agent.grasp_detector is not None:
+            gd = agent.grasp_detector(obs)
+            grasp_step_count += int(gd.sum().item())
+            grasp_step_total += E
+            ever_grasped |= gd
 
         # transition the subgoal so it tracks the moving target
         cur_g = agent.subgoal_transition(prev_obs, cur_g, obs)
@@ -162,7 +180,11 @@ def evaluate(agent: HIROAgent, eval_envs, args: TrainArgs) -> dict:
             for k, v in infos["final_info"]["episode"].items():
                 metrics[k].append(v[mask].float())
 
-    return {k: torch.cat(v).mean().item() for k, v in metrics.items() if v}
+    out = {k: torch.cat(v).mean().item() for k, v in metrics.items() if v}
+    if agent.grasp_detector is not None and grasp_step_total > 0:
+        out["greedy_grasp_rate"] = grasp_step_count / grasp_step_total      # fraction of eval steps grasped
+        out["ever_grasped"] = ever_grasped.float().mean().item()            # fraction of eval envs that ever grasped
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +224,7 @@ def train(args: TrainArgs) -> str:
         num_candidates=args.num_candidates,
         use_off_policy_correction=args.use_off_policy_correction,
         use_phased_reward=args.use_phased_reward, pbrs_alpha=args.pbrs_alpha,
+        worker_extrinsic_weight=args.worker_extrinsic_weight,
         device=args.device,
     )
     agent = HIROAgent(sp, cfg)
@@ -210,6 +233,16 @@ def train(args: TrainArgs) -> str:
         print(f"phased worker reward (PBRS): detector={'set' if agent.grasp_detector else 'NONE'} "
               f"| object_dims={sp.object_positions} | pbrs_alpha={args.pbrs_alpha} "
               f"| gamma_low={args.gamma_low}")
+    if args.worker_extrinsic_weight > 0.0:
+        print(f"HYBRID worker reward: r = {1-args.worker_extrinsic_weight:.2f}*intrinsic "
+              f"+ {args.worker_extrinsic_weight:.2f}*env_reward")
+
+    if args.oracle_manager:
+        if agent.grasp_detector is None:
+            raise RuntimeError("oracle_manager requires a grasp detector for the env")
+        oracle = make_oracle(args.env_id, args.subgoal_scale, agent.grasp_detector)
+        agent.select_subgoal = oracle           # monkey-patch: ignore manager_actor
+        print(f"ORACLE MANAGER on -- worker-only diagnostic. Manager will NOT be trained.")
 
     low_buf = LowLevelBuffer(args.low_buffer_size, args.num_envs, obs_dim, sp.dim, act_dim,
                              storage_device=args.buffer_device, sample_device=args.device)
@@ -296,7 +329,7 @@ def train(args: TrainArgs) -> str:
             low_metrics, high_metrics = {}, {}
             for _ in range(grad_steps):
                 low_metrics = agent.update_low(low_buf.sample(args.batch_size))
-            if len(high_buf) >= args.batch_size:
+            if (not args.oracle_manager) and len(high_buf) >= args.batch_size:
                 for _ in range(high_updates):
                     high_metrics = agent.update_high(high_buf.sample(args.batch_size))
 

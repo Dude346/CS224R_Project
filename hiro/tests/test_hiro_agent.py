@@ -212,6 +212,82 @@ class TestTargets:
 # Checkpointing
 # ---------------------------------------------------------------------------
 
+class TestPBRSGradientFlow:
+    """End-to-end check: the PBRS shaping must actually reach the worker's loss.
+
+    Build a small buffer of F->T grasp-transition rewards (using the actual
+    agent.worker_reward path) and confirm: (a) those rewards include the PBRS
+    bump, (b) update_low runs end-to-end on them without NaNs.
+    """
+
+    def test_pbrs_bump_in_buffer(self):
+        from hiro.subgoal_space import GRASP_DETECTORS
+        ag = make_agent()
+        ag.cfg.pbrs_alpha = 0.5
+        ag.cfg.gamma_low = 0.95
+        ag.grasp_detector = GRASP_DETECTORS["PickCube-v1"]
+
+        B = 32
+        # Construct B transitions where every one is a true F -> T grasp.
+        s = torch.zeros(B, OBS)
+        s_next = torch.zeros(B, OBS)
+        s[:, 36:39] = torch.tensor([0.2, 0.0, 0.0]);    s[:, 31] = 0.02
+        s_next[:, 36:39] = torch.tensor([0.01, 0.0, 0.0]); s_next[:, 31] = 0.10
+        g = torch.zeros(B, SG)
+
+        r = ag.worker_reward(s, g, s_next)
+        # PBRS bump dominates a zero-residual transition: r ~= +γα = +0.475
+        assert (r > 0.4).all() and (r < 0.5).all(), (
+            f"PBRS grasp bump not visible in worker reward: r={r[0].item():.4f}, expected ~0.475"
+        )
+
+    def test_update_low_runs_on_pbrs_rewards(self):
+        ag = make_agent()
+        # Hand the worker a batch with realistic PBRS-shaped rewards (~+0.5 at grasp).
+        batch = make_low(64)
+        batch.reward.fill_(0.5)
+        out = ag.update_low(batch)
+        for k in ("q_loss", "actor_loss", "alpha_loss"):
+            assert torch.isfinite(torch.tensor(out[k])), f"non-finite {k}: {out[k]}"
+
+
+class TestHybridReward:
+    """worker_extrinsic_weight blends env reward into the worker reward."""
+
+    def test_w_zero_is_pure_intrinsic(self):
+        ag = make_agent()
+        ag.cfg.worker_extrinsic_weight = 0.0
+        s, g, sn = torch.randn(8, OBS), torch.zeros(8, SG), torch.randn(8, OBS)
+        env_r = torch.full((8,), 5.0)
+        # With no detector, intrinsic = plain; env_reward must be ignored at w=0.
+        r = ag.worker_reward(s, g, sn, env_r)
+        assert torch.allclose(r, ag.sp.intrinsic_reward(s, g, sn))
+
+    def test_hybrid_blend_convex(self):
+        from hiro.subgoal_space import GRASP_DETECTORS
+        ag = make_agent()
+        ag.grasp_detector = GRASP_DETECTORS["PickCube-v1"]
+        ag.cfg.worker_extrinsic_weight = 0.5
+        s, g, sn = torch.randn(8, OBS), torch.zeros(8, SG), torch.randn(8, OBS)
+        env_r = torch.full((8,), 1.0)
+
+        # Recover the intrinsic part by querying at w=0, then check the blend.
+        ag.cfg.worker_extrinsic_weight = 0.0
+        intrinsic = ag.worker_reward(s, g, sn, env_r)
+        ag.cfg.worker_extrinsic_weight = 0.5
+        blended = ag.worker_reward(s, g, sn, env_r)
+        expected = 0.5 * intrinsic + 0.5 * env_r
+        assert torch.allclose(blended, expected, atol=1e-5)
+
+    def test_env_reward_none_falls_back_to_intrinsic(self):
+        ag = make_agent()
+        ag.cfg.worker_extrinsic_weight = 0.5
+        s, g, sn = torch.randn(4, OBS), torch.zeros(4, SG), torch.randn(4, OBS)
+        # No env_reward passed => no blend, returns intrinsic.
+        r = ag.worker_reward(s, g, sn, None)
+        assert torch.allclose(r, ag.sp.intrinsic_reward(s, g, sn))
+
+
 class TestCheckpoint:
     def test_state_dict_roundtrip(self):
         ag = make_agent()

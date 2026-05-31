@@ -12,11 +12,12 @@ from modal_train_sac import image, volume
 
 app = modal.App("inspect-hiro-run")
 
-DEFAULT_RUN = "hiro_pickcube_panda_v5_pbrs_250k"
+DEFAULT_RUN = "hiro_diag_w100_oracle_pipelinetest_250k"
 
 # Tags we care about for diagnosing a reward collapse.
 KEY_TAGS = [
     "eval/success_once", "eval/reward", "eval/return",
+    "eval/ever_grasped", "eval/greedy_grasp_rate", "eval/episode_len",
     "train/reward", "train/return", "train/success_once",
     "low/q_loss", "low/actor_loss", "low/alpha", "low/alpha_loss",
     "high/q_loss", "high/actor_loss", "high/alpha", "high/alpha_loss",

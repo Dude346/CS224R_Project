@@ -60,6 +60,11 @@ class HIROConfig:
     use_phased_reward: bool = True      # grasp-gate the object subgoal dims in the worker reward
     pbrs_alpha: float = 0.5             # PBRS grasp potential strength (Φ = α·is_grasped);
                                         # gives +γα at grasp, -α at drop, all policy-invariant
+    # Hybrid worker reward: r = (1-w)*intrinsic + w*env_reward. w=0 => pure HIRO
+    # (worker is task-agnostic, depends only on the subgoal). w>0 injects the env
+    # reward (which contains place/grasp shaping) so the worker can make task
+    # progress even under poor manager subgoals -- breaks the cold-start coupling.
+    worker_extrinsic_weight: float = 0.0
     hidden_dim: int = 256
     n_hidden: int = 3
     device: str = "cpu"
@@ -159,17 +164,20 @@ class HIROAgent:
         return self.sp.intrinsic_reward(s, g, s_next)
 
     @torch.no_grad()
-    def worker_reward(self, s, g, s_next):
+    def worker_reward(self, s, g, s_next, env_reward=None):
         """Worker reward used during rollout.
 
-        Phase-aware PBRS form (the v5 design) when a grasp detector is set AND
-        the subgoal space defines object dims AND pbrs_alpha > 0; otherwise the
-        plain intrinsic reward (-||residual||) as a no-shaping fallback.
+        Intrinsic part: phase-aware PBRS (the v5 design) when a grasp detector is
+        set AND the subgoal space defines object dims AND pbrs_alpha > 0;
+        otherwise the plain intrinsic reward (-||residual||).
+            intrinsic = -||hand_residual||
+                      + is_grasped(s) * (-||object_residual||)
+                      + γ·α·is_grasped(s') − α·is_grasped(s)   (PBRS, policy-invariant)
 
-        The phased reward:
-            r = -||hand_residual||
-              + is_grasped(s) * (-||object_residual||)
-              + γ·α·is_grasped(s') − α·is_grasped(s)        (PBRS, policy-invariant)
+        Hybrid blend (worker_extrinsic_weight = w > 0):
+            r = (1 - w) * intrinsic + w * env_reward
+        w=0 keeps the worker purely subgoal-driven (pure HIRO). w>0 lets the
+        worker see the env's place/grasp shaping, breaking the manager-cold-start.
         """
         if (
             not self.cfg.use_phased_reward
@@ -177,13 +185,19 @@ class HIROAgent:
             or not self.sp.object_positions
             or self.cfg.pbrs_alpha <= 0.0
         ):
-            return self.sp.intrinsic_reward(s, g, s_next)
-        is_grasped_s = self.grasp_detector(s)
-        is_grasped_s_next = self.grasp_detector(s_next)
-        return self.sp.phased_pbrs_intrinsic_reward(
-            s, g, s_next, is_grasped_s, is_grasped_s_next,
-            gamma=self.cfg.gamma_low, alpha=self.cfg.pbrs_alpha,
-        )
+            intrinsic = self.sp.intrinsic_reward(s, g, s_next)
+        else:
+            is_grasped_s = self.grasp_detector(s)
+            is_grasped_s_next = self.grasp_detector(s_next)
+            intrinsic = self.sp.phased_pbrs_intrinsic_reward(
+                s, g, s_next, is_grasped_s, is_grasped_s_next,
+                gamma=self.cfg.gamma_low, alpha=self.cfg.pbrs_alpha,
+            )
+
+        w = self.cfg.worker_extrinsic_weight
+        if w > 0.0 and env_reward is not None:
+            return (1.0 - w) * intrinsic + w * env_reward
+        return intrinsic
 
     # ------------------------------------------------------------------
     # action selection

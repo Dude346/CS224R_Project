@@ -12,7 +12,7 @@ from modal_train_sac import image, volume
 
 app = modal.App("inspect-hiro-run")
 
-DEFAULT_RUN = "hiro_diag_w100_oracle_pipelinetest_250k"
+DEFAULT_RUN = "hiro_diag_w100_noPR_250k"
 
 # Tags we care about for diagnosing a reward collapse.
 KEY_TAGS = [

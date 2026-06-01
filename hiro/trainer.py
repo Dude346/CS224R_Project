@@ -67,6 +67,7 @@ class TrainArgs:
     # remaining budget. Tests whether the manager retains control as the env floor is removed.
     anneal_w: bool = False
     anneal_w_grasp_threshold: float = 0.4
+    manager_utd_mult: int = 1          # D2: multiply manager gradient steps per cycle (more manager training)
     # Diagnostic mode: replace the manager with a hardcoded oracle that reads the
     # cube/goal positions from obs. Only the WORKER trains. Tests whether the
     # worker SAC can solve the task given perfect subgoals (isolates worker bugs
@@ -368,7 +369,9 @@ def train(args: TrainArgs) -> str:
 
     grad_steps = max(1, int(args.training_freq * args.utd))
     steps_per_env = max(1, args.training_freq // args.num_envs)
-    high_updates = max(1, grad_steps // args.c)   # match the c-slower high data rate
+    high_updates = max(1, (grad_steps // args.c) * args.manager_utd_mult)   # c-slower high data rate; *mult for D2
+    if args.manager_utd_mult != 1:
+        print(f"MANAGER UTD x{args.manager_utd_mult}: {high_updates} manager grad-steps/cycle (worker={grad_steps})")
 
     obs, _ = envs.reset(seed=args.seed)
     cur_subgoal = rollout.start(obs)

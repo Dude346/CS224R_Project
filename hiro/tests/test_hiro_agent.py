@@ -161,6 +161,22 @@ class TestReachBootstrap:
         assert make_agent()._reach_dims is None
 
 
+def test_load_manager_only_loads_manager():
+    # Transfer: load_manager copies ONLY the manager (+ its temperature), leaving the
+    # worker at its own (fresh, different) init.
+    src, dst = make_agent(), make_agent()
+    dst.load_manager(src.state_dict())
+    for ps, pd in zip(src.nets.manager_actor.parameters(), dst.nets.manager_actor.parameters()):
+        assert torch.allclose(ps, pd)
+    assert torch.allclose(src.log_alpha_high, dst.log_alpha_high)
+    # worker must NOT have been overwritten (dst keeps its own random worker)
+    worker_differs = any(
+        not torch.allclose(ps, pd)
+        for ps, pd in zip(src.nets.worker_actor.parameters(), dst.nets.worker_actor.parameters())
+    )
+    assert worker_differs
+
+
 # ---------------------------------------------------------------------------
 # Construction / action selection
 # ---------------------------------------------------------------------------

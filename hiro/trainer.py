@@ -87,6 +87,11 @@ class TrainArgs:
     # restored (they refill from the loaded policy). Use learning_starts=0 so the
     # trained policy collects data immediately instead of random warmup.
     resume_from_ckpt: str = ""
+    # Transfer: load ONLY the manager (high level) from a checkpoint; the worker starts
+    # fresh. Pair with freeze_manager to reuse a body-independent object-centric manager
+    # and re-adapt only the worker on a new embodiment.
+    pretrained_manager_ckpt: str = ""
+    freeze_manager: bool = False      # don't train the manager (skip update_high); it still acts
     # partial_reset=True: episodes end on TRUE termination (env success), not just
     # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
     # success). Flat SAC baselines used False to match upstream.
@@ -338,6 +343,15 @@ def train(args: TrainArgs) -> str:
               f"(checkpoint step {ckpt.get('step', '?')}); training {args.total_timesteps} more steps. "
               f"Replay buffers start empty and refill from the loaded policy.")
 
+    if args.pretrained_manager_ckpt:
+        ckpt = torch.load(args.pretrained_manager_ckpt, map_location=args.device, weights_only=False)
+        agent.load_manager(ckpt["agent"])
+        print(f"PRETRAINED MANAGER loaded from {args.pretrained_manager_ckpt} "
+              f"(checkpoint step {ckpt.get('step', '?')}). Worker starts FRESH (random init).")
+    if args.freeze_manager:
+        print("FREEZE MANAGER on -- manager acts but is NOT trained (update_high skipped). "
+              "Transfer setup: reuse manager, adapt only the worker.")
+
     low_buf = LowLevelBuffer(args.low_buffer_size, args.num_envs, obs_dim, sp.dim, act_dim,
                              storage_device=args.buffer_device, sample_device=args.device)
     high_buf = HighLevelBuffer(args.high_buffer_size, obs_dim, sp.dim, act_dim, args.c,
@@ -444,7 +458,7 @@ def train(args: TrainArgs) -> str:
             low_metrics, high_metrics = {}, {}
             for _ in range(grad_steps):
                 low_metrics = agent.update_low(low_buf.sample(args.batch_size))
-            if (not args.oracle_manager) and (not args.flat_worker) and len(high_buf) >= args.batch_size:
+            if (not args.oracle_manager) and (not args.flat_worker) and (not args.freeze_manager) and len(high_buf) >= args.batch_size:
                 for _ in range(high_updates):
                     high_metrics = agent.update_high(high_buf.sample(args.batch_size))
 

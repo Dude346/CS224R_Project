@@ -473,3 +473,14 @@ class HIROAgent:
         self.worker_critic_target.load_state_dict(sd["worker_critic_target"])
         with torch.no_grad():
             self.log_alpha_low.copy_(sd["log_alpha_low"].to(self.device))
+
+    def load_manager(self, sd: dict) -> None:
+        """Load ONLY the manager (high-level) from a checkpoint state_dict, leaving the
+        worker at fresh random init. Used for embodiment TRANSFER: reuse a (body-
+        independent, object-centric) manager and re-adapt only the worker on a new
+        embodiment. Pair with freeze_manager to keep the transferred manager fixed."""
+        self.nets.manager_actor.load_state_dict(sd["manager_actor"])
+        self.nets.manager_critic.load_state_dict(sd["manager_critic"])
+        self.manager_critic_target.load_state_dict(sd["manager_critic_target"])
+        with torch.no_grad():
+            self.log_alpha_high.copy_(sd["log_alpha_high"].to(self.device))

@@ -255,6 +255,34 @@ HIRO_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
 
 
 # ---------------------------------------------------------------------------
+# Phase 5: CUBE-CENTRIC (object-only) subgoal spaces.
+# The subgoal is ONLY the object position (no TCP/hand dims). Combined with the
+# phased grasp-gated reward this makes hand_positions empty => hand_term == 0,
+# so the worker can no longer farm reward by hovering the gripper at a TCP
+# target without grasping (the Test-G hover hack). The worker earns intrinsic
+# reward ONLY by (a) grasping [PBRS bonus] and (b) moving the GRASPED object
+# toward the manager's commanded object target [grasp-gated cube term].
+# Pre-grasp guidance comes from the hybrid env reward (worker_extrinsic_weight),
+# so use this mode WITH the phased reward and w>0.
+# ---------------------------------------------------------------------------
+
+CUBE_CENTRIC_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
+    "PickCube-v1": SubgoalSpace(
+        indices=[29, 30, 31],          # cube_xyz only (extra.obj_pose[:3])
+        obs_dim=42,
+        label="cube_xyz (object-centric)",
+        object_dims=(0, 1, 2),         # ALL dims grasp-gated => hand_term empty
+    ),
+    "StackCube-v1": SubgoalSpace(
+        indices=[25, 26, 27],          # cubeA_xyz only (extra.cubeA_pose[:3])
+        obs_dim=48,
+        label="cubeA_xyz (object-centric)",
+        object_dims=(0, 1, 2),
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Grasp-state readers for the phased/PBRS worker reward.
 # PickCube already exposes a true binary is_grasped flag in the observation, so
 # use that directly. StackCube does not, so it falls back to the old position-
@@ -302,11 +330,51 @@ def get_grasp_detector(env_id: str) -> "GraspReader | None":
     return GRASP_DETECTORS.get(env_id)
 
 
-def get_subgoal_space(env_id: str) -> SubgoalSpace:
-    """Return the canonical HIRO subgoal space for the given env."""
-    if env_id not in HIRO_SUBGOAL_SPACES:
+def get_subgoal_space(env_id: str, mode: str = "hiro") -> SubgoalSpace:
+    """Return the subgoal space for the given env.
+
+    mode="hiro"         : canonical tcp+object positions (default; original).
+    mode="cube_centric" : object-only positions (Phase 5; kills the hover hack).
+    """
+    table = CUBE_CENTRIC_SUBGOAL_SPACES if mode == "cube_centric" else HIRO_SUBGOAL_SPACES
+    if env_id not in table:
         raise ValueError(
-            f"No canonical subgoal space defined for {env_id!r}. "
-            f"Known envs: {list(HIRO_SUBGOAL_SPACES)}"
+            f"No {mode} subgoal space defined for {env_id!r}. Known envs: {list(table)}"
         )
-    return HIRO_SUBGOAL_SPACES[env_id]
+    return table[env_id]
+
+
+# ---------------------------------------------------------------------------
+# Cube->goal residual dims: the env-provided vector whose L2 norm is the
+# object-to-goal distance. Used by (a) the manager place-PBRS potential
+# Phi = -beta*||cube-goal|| and (b) the eval cube-at-goal / subgoal-alignment
+# diagnostics. PickCube exposes extra.obj_to_goal_pos at obs[39:42];
+# StackCube exposes extra.cubeA_to_cubeB_pos at obs[45:48].
+# ---------------------------------------------------------------------------
+
+PLACE_RESIDUAL_DIMS: dict[str, tuple[int, ...]] = {
+    "PickCube-v1": (39, 40, 41),
+    "StackCube-v1": (45, 46, 47),
+}
+
+
+def get_place_residual_dims(env_id: str) -> "tuple[int, ...] | None":
+    """Obs indices of the cube->goal vector (||.|| = cube-to-goal distance)."""
+    return PLACE_RESIDUAL_DIMS.get(env_id)
+
+
+# ---------------------------------------------------------------------------
+# tcp->object vector dims, for the Phase-D pre-grasp reach bootstrap. ||.|| is
+# the gripper-to-object distance. PickCube exposes extra.tcp_to_obj_pos at
+# obs[36:39]; StackCube exposes extra.tcp_to_cubeA_pos at obs[39:42].
+# ---------------------------------------------------------------------------
+
+REACH_DIMS: dict[str, tuple[int, ...]] = {
+    "PickCube-v1": (36, 37, 38),
+    "StackCube-v1": (39, 40, 41),
+}
+
+
+def get_reach_dims(env_id: str) -> "tuple[int, ...] | None":
+    """Obs indices of the tcp->object vector (||.|| = gripper-to-object distance)."""
+    return REACH_DIMS.get(env_id)

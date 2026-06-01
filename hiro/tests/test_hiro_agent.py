@@ -20,7 +20,7 @@ import torch
 
 from hiro.hiro_agent import HIROAgent, HIROConfig
 from hiro.replay_buffer import HighLevelSample, LowLevelSample
-from hiro.subgoal_space import HIRO_SUBGOAL_SPACES
+from hiro.subgoal_space import GRASP_DETECTORS, HIRO_SUBGOAL_SPACES
 
 OBS, SG, ACT = 42, 6, 8          # PickCube-v1 HIRO subgoal space
 SCALE = 0.5
@@ -63,6 +63,102 @@ def make_high(B: int, c: int, inter_len=None) -> HighLevelSample:
         inter_act=torch.rand(B, c, ACT) * 2 - 1,
         inter_len=inter_len,
     )
+
+
+def make_place_agent(beta: float = 2.0, gamma_high: float = 0.8) -> HIROAgent:
+    """Agent with Phase-2 manager place-PBRS enabled (PickCube cube->goal dims)."""
+    sp = HIRO_SUBGOAL_SPACES["PickCube-v1"]
+    cfg = HIROConfig(action_dim=ACT, c=5, subgoal_scale=SCALE, device="cpu",
+                     gamma_high=gamma_high, place_pbrs_beta=beta,
+                     place_residual_dims=(39, 40, 41))
+    return HIROAgent(sp, cfg)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: manager place-PBRS shaping
+# ---------------------------------------------------------------------------
+
+class TestManagerPlacePBRS:
+    def test_shaping_matches_formula(self):
+        ag = make_place_agent(beta=2.0, gamma_high=0.8)
+        B = 5
+        s0, s_c = torch.randn(B, OBS), torch.randn(B, OBS)
+        done = torch.tensor([0., 0., 1., 0., 1.])
+        dims = torch.tensor([39, 40, 41])
+        phi0 = -2.0 * s0[:, dims].norm(dim=-1)
+        phic = -2.0 * s_c[:, dims].norm(dim=-1)
+        expected = 0.8 * phic * (1.0 - done) - phi0
+        got = ag._manager_place_shaping(s0, s_c, done)
+        assert torch.allclose(got, expected, atol=1e-5)
+
+    def test_done_masks_next_potential(self):
+        # When done=1, the gamma*Phi(s_c) term must vanish (Phi(terminal)=0) so
+        # shaping reduces to -Phi(s0); policy-invariance for the episodic MDP.
+        ag = make_place_agent(beta=1.5)
+        s0, s_c = torch.randn(3, OBS), torch.randn(3, OBS)
+        done = torch.ones(3)
+        dims = torch.tensor([39, 40, 41])
+        expected = 1.5 * s0[:, dims].norm(dim=-1)  # -Phi(s0) = +beta*||s0[dims]||
+        assert torch.allclose(ag._manager_place_shaping(s0, s_c, done), expected, atol=1e-5)
+
+    def test_disabled_by_default(self):
+        # Default agent has no place dims => shaping path is off.
+        ag = make_agent()
+        assert ag._place_dims is None
+
+    def test_update_high_runs_with_pbrs(self):
+        ag = make_place_agent(beta=1.0)
+        m = ag.update_high(make_high(8, c=5))
+        for k in ("q_loss", "q_mean", "entropy"):
+            assert k in m and torch.isfinite(torch.tensor(m[k]))
+
+
+# ---------------------------------------------------------------------------
+# Phase D: pre-grasp reach-to-cube PBRS bootstrap (worker_reward)
+# ---------------------------------------------------------------------------
+
+class TestReachBootstrap:
+    K, G = 2.0, 0.8
+    REACH = (36, 37, 38)   # PickCube tcp_to_obj_pos
+
+    def _agent(self, weight: float) -> HIROAgent:
+        sp = HIRO_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(action_dim=ACT, c=5, subgoal_scale=SCALE, device="cpu",
+                         gamma_low=self.G, reach_pbrs_weight=weight, reach_dims=self.REACH)
+        ag = HIROAgent(sp, cfg)
+        ag.grasp_detector = GRASP_DETECTORS["PickCube-v1"]   # worker_reward needs it
+        return ag
+
+    def _phi(self, s):
+        d = s[:, list(self.REACH)].norm(dim=-1)
+        return self.K * (1.0 - torch.tanh(5.0 * d))
+
+    def test_reach_shaping_matches_formula(self):
+        # worker_reward does NOT touch the actor, so (weight=K) - (weight=0) isolates
+        # the reach shaping = gamma_low*Phi(s') - Phi(s) exactly.
+        a0, ak = self._agent(0.0), self._agent(self.K)
+        B = 4
+        s, s_next = torch.randn(B, OBS), torch.randn(B, OBS)
+        g = (torch.rand(B, SG) * 2 - 1) * 0.1
+        delta = ak.worker_reward(s, g, s_next) - a0.worker_reward(s, g, s_next)
+        expected = self.G * self._phi(s_next) - self._phi(s)
+        assert torch.allclose(delta, expected, atol=1e-5)
+
+    def test_approaching_positive_hovering_is_tax(self):
+        a0, ak = self._agent(0.0), self._agent(self.K)
+        g = torch.zeros(1, SG)
+
+        def shaping(d_s, d_n):
+            s, sn = torch.zeros(1, OBS), torch.zeros(1, OBS)
+            s[0, list(self.REACH)] = torch.tensor([d_s, 0.0, 0.0])
+            sn[0, list(self.REACH)] = torch.tensor([d_n, 0.0, 0.0])
+            return (ak.worker_reward(s, g, sn) - a0.worker_reward(s, g, sn)).item()
+
+        assert shaping(0.30, 0.02) > 0      # approaching the cube is rewarded
+        assert shaping(0.01, 0.01) < 0      # hovering at the cube nets only the (gamma-1) tax => non-farmable
+
+    def test_disabled_by_default(self):
+        assert make_agent()._reach_dims is None
 
 
 # ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ from hiro.hiro_agent import HIROAgent, HIROConfig
 from hiro.replay_buffer import HighLevelBuffer, LowLevelBuffer
 from hiro.rollout import HierarchicalRollout
 from hiro.oracle import make_oracle
-from hiro.subgoal_space import get_grasp_detector, get_subgoal_space
+from hiro.subgoal_space import get_grasp_detector, get_place_residual_dims, get_reach_dims, get_subgoal_space
 
 
 @dataclass
@@ -53,17 +53,39 @@ class TrainArgs:
     # HIRO hyperparameters
     c: int = 10
     subgoal_scale: float = 0.15
+    subgoal_mode: str = "hiro"        # "hiro" (tcp+object) | "cube_centric" (object-only, Phase 5)
     gamma_low: float = 0.95
     gamma_high: float = 0.8
     tau: float = 0.005
     use_phased_reward: bool = True
     pbrs_alpha: float = 0.5            # PBRS grasp potential strength (replaces grasp_bonus)
     worker_extrinsic_weight: float = 0.0  # hybrid: r_worker = (1-w)*intrinsic + w*env_reward
+    place_pbrs_beta: float = 0.0       # Phase 2: manager place-PBRS strength (Phi=-beta*||cube-goal||); 0=off
+    reach_pbrs_weight: float = 0.0     # Phase D: pre-grasp reach-to-cube PBRS bootstrap on the worker; 0=off
+    # Exp 1 (curriculum anneal): hold worker_extrinsic_weight (w) until grasping bootstraps
+    # (train grasp_rate > anneal_w_grasp_threshold), THEN linearly anneal w->0 over the
+    # remaining budget. Tests whether the manager retains control as the env floor is removed.
+    anneal_w: bool = False
+    anneal_w_grasp_threshold: float = 0.4
     # Diagnostic mode: replace the manager with a hardcoded oracle that reads the
     # cube/goal positions from obs. Only the WORKER trains. Tests whether the
     # worker SAC can solve the task given perfect subgoals (isolates worker bugs
     # from manager/cold-start issues).
     oracle_manager: bool = False
+    # Diagnostic mode: constant ZERO subgoal (no manager, no re-issue, no
+    # transition). With worker_extrinsic_weight=1.0 this makes the worker a plain
+    # flat-SAC agent inside our pipeline -- isolates "our SAC code/rollout" from
+    # "the hierarchy" as the cause of any failure.
+    flat_worker: bool = False
+    # Worker-pretraining: path to a checkpoint to warm-start ONLY the worker
+    # (the manager still trains from scratch). Collapses the HIRO cold-start by
+    # starting with an already-competent subgoal-following worker.
+    pretrained_worker_ckpt: str = ""
+    # Resume: path to a checkpoint to load the FULL agent (worker + manager +
+    # targets + temperatures) and continue training. Replay buffers are NOT
+    # restored (they refill from the loaded policy). Use learning_starts=0 so the
+    # trained policy collects data immediately instead of random warmup.
+    resume_from_ckpt: str = ""
     # partial_reset=True: episodes end on TRUE termination (env success), not just
     # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
     # success). Flat SAC baselines used False to match upstream.
@@ -154,9 +176,34 @@ def evaluate(agent: HIROAgent, eval_envs, args: TrainArgs) -> dict:
     grasp_step_count = 0
     grasp_step_total = 0
     ever_grasped = torch.zeros(E, dtype=torch.bool, device=device)
+
+    # Phase-2 campaign diagnostics. place_dims = obs indices of the cube->goal
+    # vector (extra.obj_to_goal_pos = goal - cube), so ||obs[place_dims]|| is the
+    # cube-to-goal distance and its direction is "where the cube should go".
+    place_dims = get_place_residual_dims(args.env_id)
+    place_dims_t = torch.tensor(place_dims, device=device, dtype=torch.long) if place_dims else None
+    obj_pos = agent.sp.object_positions  # positions within the subgoal that target the cube
+    place_dist_sum, place_dist_n = 0.0, 0
+    cube_at_goal_count = 0               # steps with cube within 5 cm of goal
+    align_sum, align_n = 0.0, 0          # cube-subgoal vs cube->goal cosine, grasped steps only
     for _ in range(args.num_eval_steps):
         action = agent.select_action(obs, cur_g, deterministic=True)
         prev_obs = obs
+
+        # --- manager intent diagnostic (uses the action-time subgoal + prev_obs) ---
+        if place_dims_t is not None and obj_pos:
+            to_goal = prev_obs[..., place_dims_t]                 # (E,3) goal - cube
+            d = torch.norm(to_goal, dim=-1)                       # (E,)
+            place_dist_sum += float(d.sum().item()); place_dist_n += E
+            cube_at_goal_count += int((d < 0.05).sum().item())
+            g_obj = cur_g[..., obj_pos]                           # (E,3) commanded cube displacement
+            if agent.grasp_detector is not None:
+                gmask = agent.grasp_detector(prev_obs)
+                if gmask.any():
+                    cos = torch.nn.functional.cosine_similarity(
+                        g_obj[gmask], to_goal[gmask], dim=-1, eps=1e-6)
+                    align_sum += float(cos.sum().item()); align_n += int(gmask.sum().item())
+
         obs, _, terminations, truncations, infos = eval_envs.step(action)
 
         if agent.grasp_detector is not None:
@@ -184,6 +231,11 @@ def evaluate(agent: HIROAgent, eval_envs, args: TrainArgs) -> dict:
     if agent.grasp_detector is not None and grasp_step_total > 0:
         out["greedy_grasp_rate"] = grasp_step_count / grasp_step_total      # fraction of eval steps grasped
         out["ever_grasped"] = ever_grasped.float().mean().item()            # fraction of eval envs that ever grasped
+    if place_dist_n > 0:
+        out["place_dist"] = place_dist_sum / place_dist_n                   # mean ||cube-goal|| (m); lower=better
+        out["cube_at_goal_rate"] = cube_at_goal_count / place_dist_n        # fraction of steps cube within 5cm of goal
+    if align_n > 0:
+        out["subgoal_goal_align"] = align_sum / align_n                     # cos(cube-subgoal, cube->goal) | grasped; >0 = manager commands transport
     return out
 
 
@@ -213,8 +265,10 @@ def train(args: TrainArgs) -> str:
     low = np.asarray(envs.single_action_space.low).reshape(-1)
     high = np.asarray(envs.single_action_space.high).reshape(-1)
 
-    sp = get_subgoal_space(args.env_id)
+    sp = get_subgoal_space(args.env_id, args.subgoal_mode)
     assert sp.obs_dim == obs_dim, f"subgoal space obs_dim {sp.obs_dim} != env obs_dim {obs_dim}"
+    if args.subgoal_mode != "hiro":
+        print(f"SUBGOAL MODE = {args.subgoal_mode}: {sp!r} indices={sp.indices} object_dims={sp.object_dims}")
 
     cfg = HIROConfig(
         action_dim=act_dim, c=args.c, subgoal_scale=args.subgoal_scale,
@@ -225,9 +279,25 @@ def train(args: TrainArgs) -> str:
         use_off_policy_correction=args.use_off_policy_correction,
         use_phased_reward=args.use_phased_reward, pbrs_alpha=args.pbrs_alpha,
         worker_extrinsic_weight=args.worker_extrinsic_weight,
+        place_pbrs_beta=args.place_pbrs_beta,
+        place_residual_dims=tuple(get_place_residual_dims(args.env_id) or ())
+            if args.place_pbrs_beta > 0.0 else (),
+        reach_pbrs_weight=args.reach_pbrs_weight,
+        reach_dims=tuple(get_reach_dims(args.env_id) or ())
+            if args.reach_pbrs_weight > 0.0 else (),
         device=args.device,
     )
     agent = HIROAgent(sp, cfg)
+    if args.reach_pbrs_weight > 0.0:
+        if not cfg.reach_dims:
+            raise RuntimeError(f"reach_pbrs_weight>0 but no reach_dims for env {args.env_id!r}")
+        print(f"WORKER reach-PBRS bootstrap on: Phi={args.reach_pbrs_weight}*(1-tanh(5*||tcp-cube||)) "
+              f"(tcp->obj dims={cfg.reach_dims}, gamma_low={args.gamma_low})")
+    if args.place_pbrs_beta > 0.0:
+        if not cfg.place_residual_dims:
+            raise RuntimeError(f"place_pbrs_beta>0 but no place_residual_dims for env {args.env_id!r}")
+        print(f"MANAGER place-PBRS on: Phi=-{args.place_pbrs_beta}*||cube-goal|| "
+              f"(cube->goal dims={cfg.place_residual_dims}, gamma_high={args.gamma_high})")
     if args.use_phased_reward:
         agent.grasp_detector = get_grasp_detector(args.env_id)
         print(f"phased worker reward (PBRS): detector={'set' if agent.grasp_detector else 'NONE'} "
@@ -240,9 +310,32 @@ def train(args: TrainArgs) -> str:
     if args.oracle_manager:
         if agent.grasp_detector is None:
             raise RuntimeError("oracle_manager requires a grasp detector for the env")
-        oracle = make_oracle(args.env_id, args.subgoal_scale, agent.grasp_detector)
+        oracle = make_oracle(args.env_id, args.subgoal_scale, agent.grasp_detector,
+                             cube_only=(args.subgoal_mode == "cube_centric"))
         agent.select_subgoal = oracle           # monkey-patch: ignore manager_actor
         print(f"ORACLE MANAGER on -- worker-only diagnostic. Manager will NOT be trained.")
+
+    if args.flat_worker:
+        # Constant zero subgoal that never transitions => worker sees [obs, 0...0]
+        # every step == plain flat SAC in our pipeline. Use with w=1.0.
+        sg_dim = sp.dim
+        agent.select_subgoal = lambda obs, deterministic=False: torch.zeros(
+            obs.shape[0], sg_dim, device=device)
+        agent.subgoal_transition = lambda s, g, s_next: torch.zeros_like(g)
+        print("FLAT WORKER on -- constant zero subgoal (flat-SAC-equivalent in our pipeline).")
+
+    if args.pretrained_worker_ckpt:
+        ckpt = torch.load(args.pretrained_worker_ckpt, map_location=args.device, weights_only=False)
+        agent.load_worker(ckpt["agent"])
+        print(f"PRETRAINED WORKER loaded from {args.pretrained_worker_ckpt} "
+              f"(checkpoint step {ckpt.get('step', '?')}). Manager starts FRESH.")
+
+    if args.resume_from_ckpt:
+        ckpt = torch.load(args.resume_from_ckpt, map_location=args.device, weights_only=False)
+        agent.load_state_dict(ckpt["agent"])
+        print(f"RESUMED full agent (worker + manager) from {args.resume_from_ckpt} "
+              f"(checkpoint step {ckpt.get('step', '?')}); training {args.total_timesteps} more steps. "
+              f"Replay buffers start empty and refill from the loaded policy.")
 
     low_buf = LowLevelBuffer(args.low_buffer_size, args.num_envs, obs_dim, sp.dim, act_dim,
                              storage_device=args.buffer_device, sample_device=args.device)
@@ -263,8 +356,14 @@ def train(args: TrainArgs) -> str:
         if args.track:
             import wandb
             wandb.log({f"eval/{k}": v for k, v in em.items()}, step=step)
-        print(f"[step {step:>9}] eval success_once={em.get('success_once', float('nan')):.3f}  "
-              f"return={em.get('return', float('nan')):.2f}")
+        print(f"[step {step:>9}] w={agent.cfg.worker_extrinsic_weight:.2f}  "
+              f"eval success_once={em.get('success_once', float('nan')):.3f}  "
+              f"return={em.get('return', float('nan')):.2f}  "
+              f"reward={em.get('reward', float('nan')):.3f}  "
+              f"ever_grasped={em.get('ever_grasped', float('nan')):.2f}  "
+              f"place_dist={em.get('place_dist', float('nan')):.3f}  "
+              f"cube@goal={em.get('cube_at_goal_rate', float('nan')):.3f}  "
+              f"sg_align={em.get('subgoal_goal_align', float('nan')):+.3f}")
         return em
 
     grad_steps = max(1, int(args.training_freq * args.utd))
@@ -277,9 +376,22 @@ def train(args: TrainArgs) -> str:
     learning_started = False
     last_eval = 0
     last_save = 0
+    # Exp 1 anneal state (no-op unless args.anneal_w).
+    w_start = args.worker_extrinsic_weight
+    anneal_started = False
+    anneal_start_step = 0
     run_eval(0)   # baseline (random-policy) point so the curve starts at step 0
 
     while global_step < args.total_timesteps:
+        # ---- Exp 1: curriculum-anneal the env-reward weight w. Hold w_start until grasping
+        #      bootstraps; once triggered, linearly anneal w->0 over the remaining budget so
+        #      the manager must take over transport. Mutates cfg (read by worker_reward).
+        if args.anneal_w:
+            if anneal_started:
+                frac = max(0.0, 1.0 - (global_step - anneal_start_step) / max(1, args.total_timesteps - anneal_start_step))
+                agent.cfg.worker_extrinsic_weight = w_start * frac
+            else:
+                agent.cfg.worker_extrinsic_weight = w_start
         # ---- collect rollout ----
         for _ in range(steps_per_env):
             if not learning_started:
@@ -329,7 +441,7 @@ def train(args: TrainArgs) -> str:
             low_metrics, high_metrics = {}, {}
             for _ in range(grad_steps):
                 low_metrics = agent.update_low(low_buf.sample(args.batch_size))
-            if (not args.oracle_manager) and len(high_buf) >= args.batch_size:
+            if (not args.oracle_manager) and (not args.flat_worker) and len(high_buf) >= args.batch_size:
                 for _ in range(high_updates):
                     high_metrics = agent.update_high(high_buf.sample(args.batch_size))
 
@@ -348,6 +460,13 @@ def train(args: TrainArgs) -> str:
                 if agent.grasp_detector is not None:
                     grasp_rate = agent.grasp_detector(ls.next_obs).float().mean().item()
                     writer.add_scalar("data/grasp_rate", grasp_rate, global_step)
+                    # Exp 1: once grasping is bootstrapped, begin annealing w->0.
+                    if args.anneal_w and not anneal_started and grasp_rate > args.anneal_w_grasp_threshold:
+                        anneal_started = True
+                        anneal_start_step = global_step
+                        print(f"[anneal_w] grasp_rate {grasp_rate:.2f} > {args.anneal_w_grasp_threshold} "
+                              f"at step {global_step}: annealing w {w_start}->0 over remaining budget")
+                writer.add_scalar("data/worker_w", agent.cfg.worker_extrinsic_weight, global_step)
                 if len(high_buf) > 0:
                     hs = high_buf.sample(min(args.batch_size, len(high_buf)))
                     writer.add_scalar("data/mean_manager_reward", hs.reward_sum.mean().item(), global_step)

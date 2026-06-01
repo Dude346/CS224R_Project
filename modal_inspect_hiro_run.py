@@ -12,18 +12,22 @@ from modal_train_sac import image, volume
 
 app = modal.App("inspect-hiro-run")
 
-DEFAULT_RUN = "hiro_diag_w100_noPR_250k"
+DEFAULT_RUN = "hiro_FULL_RESUMED_w50_g08_plus1500k"
 
 # Tags we care about for diagnosing a reward collapse.
 KEY_TAGS = [
     "eval/success_once", "eval/reward", "eval/return",
     "eval/ever_grasped", "eval/greedy_grasp_rate", "eval/episode_len",
+    # Phase-2 campaign diagnostics
+    "eval/place_dist", "eval/cube_at_goal_rate", "eval/subgoal_goal_align",
     "train/reward", "train/return", "train/success_once",
     "low/q_loss", "low/actor_loss", "low/alpha", "low/alpha_loss",
+    "low/q_mean", "low/entropy",
     "high/q_loss", "high/actor_loss", "high/alpha", "high/alpha_loss",
+    "high/q_mean", "high/q_max", "high/entropy",
     "data/mean_intrinsic_reward", "data/mean_manager_reward",
     "data/mean_subgoal_norm", "data/low_buffer", "data/high_buffer",
-    "data/grasp_rate",
+    "data/grasp_rate", "data/worker_w",
 ]
 
 

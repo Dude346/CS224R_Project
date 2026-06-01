@@ -65,6 +65,25 @@ class HIROConfig:
     # reward (which contains place/grasp shaping) so the worker can make task
     # progress even under poor manager subgoals -- breaks the cold-start coupling.
     worker_extrinsic_weight: float = 0.0
+    # Phase 2 (manager place-PBRS): ungated, policy-invariant potential added to the
+    # MANAGER reward, Phi(s) = -beta*||cube-goal||. Shaping F = gamma_high*Phi(s_c)*(1-done)
+    # - Phi(s0) rewards NET progress of the cube toward the goal regardless of grasp,
+    # removing the drop-cliff from the manager's objective (the grasp-and-hold local
+    # optimum). beta=0 disables. place_residual_dims = obs indices of the cube->goal
+    # vector (set by the trainer from get_place_residual_dims(env_id)).
+    place_pbrs_beta: float = 0.0
+    place_residual_dims: tuple = ()
+    # Phase D (reach bootstrap): potential-based pre-grasp shaping on the WORKER,
+    # Phi_reach(s) = w * (1 - tanh(5*||tcp - cube||)), shaping = gamma_low*Phi(s') - Phi(s).
+    # Object-anchored (rewards getting the gripper TO the cube -- the prerequisite
+    # for grasping), so it cannot be hover-hacked the way an arbitrary TCP-target
+    # term could. Potential-based => non-farmable (hovering at the cube nets the
+    # small w*(gamma-1) tax, like the grasp PBRS). Naturally ~0 post-grasp because
+    # the gripper stays on the cube (||tcp-cube||~=0 => Phi~=const). Lets a pure
+    # intrinsic (w_env=0) worker bootstrap grasping with NO env reward, so the
+    # manager-load-bearing test is clean. reach_dims = obs indices of tcp->object.
+    reach_pbrs_weight: float = 0.0
+    reach_dims: tuple = ()
     hidden_dim: int = 256
     n_hidden: int = 3
     device: str = "cpu"
@@ -137,6 +156,18 @@ class HIROAgent:
         # reward; otherwise it falls back to the plain intrinsic reward.
         self.grasp_detector = None
 
+        # Phase 2: manager place-PBRS. Obs indices of the cube->goal vector; None
+        # disables the shaping (also disabled when place_pbrs_beta <= 0).
+        self._place_dims = (
+            torch.tensor(cfg.place_residual_dims, dtype=torch.long, device=self.device)
+            if cfg.place_residual_dims else None
+        )
+        # Phase D: pre-grasp reach bootstrap. Obs indices of the tcp->object vector.
+        self._reach_dims = (
+            torch.tensor(cfg.reach_dims, dtype=torch.long, device=self.device)
+            if cfg.reach_dims else None
+        )
+
     # ------------------------------------------------------------------
     # setup helpers
     # ------------------------------------------------------------------
@@ -193,6 +224,17 @@ class HIROAgent:
                 s, g, s_next, is_grasped_s, is_grasped_s_next,
                 gamma=self.cfg.gamma_low, alpha=self.cfg.pbrs_alpha,
             )
+
+        # Phase D: pre-grasp reach-to-cube PBRS bootstrap (object-anchored, non-farmable).
+        #   Phi(s) = w_reach * (1 - tanh(5*||tcp-cube||));  shaping = gamma_low*Phi(s') - Phi(s)
+        # Rewards approaching the cube; hovering at it nets only the w_reach*(gamma-1) tax;
+        # ~0 once grasped (gripper stays on the cube). Added to the intrinsic so it also
+        # bootstraps a pure (w_env=0) worker.
+        if self.cfg.reach_pbrs_weight > 0.0 and self._reach_dims is not None:
+            k = self.cfg.reach_pbrs_weight
+            phi_s = k * (1.0 - torch.tanh(5.0 * torch.norm(s[..., self._reach_dims], dim=-1)))
+            phi_next = k * (1.0 - torch.tanh(5.0 * torch.norm(s_next[..., self._reach_dims], dim=-1)))
+            intrinsic = intrinsic + self.cfg.gamma_low * phi_next - phi_s
 
         w = self.cfg.worker_extrinsic_weight
         if w > 0.0 and env_reward is not None:
@@ -328,6 +370,10 @@ class HIROAgent:
             "actor_loss": actor_loss.item(),
             "alpha_loss": alpha_loss.item(),
             "alpha": optims.log_alpha.exp().item(),
+            # diagnostics: Q magnitude (divergence watch) + policy entropy (collapse watch)
+            "q_mean": q1.mean().item(),
+            "q_max": q1.detach().abs().max().item(),
+            "entropy": (-logpi).mean().item(),
         }
 
     def update_low(self, batch: LowLevelSample) -> dict:
@@ -344,24 +390,49 @@ class HIROAgent:
             next_state=next_state, done=batch.done,
         )
 
+    @torch.no_grad()
+    def _manager_place_shaping(self, s0, s_c, done) -> torch.Tensor:
+        """Phase 2 place-PBRS shaping for the manager reward (policy-invariant).
+
+            Phi(s) = -beta * ||cube - goal||                       (= -beta*||s[place_dims]||)
+            F      = gamma_high * Phi(s_c) * (1 - done) - Phi(s0)
+
+        Ng et al. (1999): adding F = gamma*Phi(s') - Phi(s) to the reward leaves
+        the optimal policy unchanged, so this only *re-shapes the gradient* toward
+        moving the cube to the goal -- it does NOT introduce a reward the manager
+        can farm. Phi(terminal)=0 is enforced via the (1-done) mask so the
+        invariance holds for the episodic (success-terminating) MDP. Returns (B,).
+        """
+        dims = self._place_dims
+        beta = self.cfg.place_pbrs_beta
+        phi_s0 = -beta * torch.norm(s0[..., dims], dim=-1)     # (B,)
+        phi_sc = -beta * torch.norm(s_c[..., dims], dim=-1)    # (B,)
+        return self.cfg.gamma_high * phi_sc * (1.0 - done.float()) - phi_s0
+
     def update_high(self, batch: HighLevelSample) -> dict:
         """SAC update for the manager, after off-policy relabeling of the action.
 
         With cfg.use_off_policy_correction=False the manager trains on the raw
         stored subgoal g0 — a debugging knob to isolate whether the correction
         helps or hurts.
+
+        When place_pbrs_beta>0, an ungated potential-based place reward is added
+        to reward_sum (Phase 2) to remove the manager's grasp-and-hold cliff.
         """
         if self.cfg.use_off_policy_correction:
             action = self.off_policy_correct(batch)
         else:
             action = batch.g0
+        reward = batch.reward_sum
+        if self.cfg.place_pbrs_beta > 0.0 and self._place_dims is not None:
+            reward = reward + self._manager_place_shaping(batch.s0, batch.s_c, batch.done)
         return self._sac_update(
             actor=self.nets.manager_actor,
             critic=self.nets.manager_critic,
             critic_target=self.manager_critic_target,
             optims=self.high,
             gamma=self.cfg.gamma_high,
-            state=batch.s0, action=action, reward=batch.reward_sum,
+            state=batch.s0, action=action, reward=reward,
             next_state=batch.s_c, done=batch.done,
         )
 
@@ -391,3 +462,14 @@ class HIROAgent:
         with torch.no_grad():
             self.log_alpha_low.copy_(sd["log_alpha_low"].to(self.device))
             self.log_alpha_high.copy_(sd["log_alpha_high"].to(self.device))
+
+    def load_worker(self, sd: dict) -> None:
+        """Warm-start ONLY the worker (low-level) from a checkpoint state_dict,
+        leaving the manager at its fresh random init. Used for worker-pretraining:
+        plug in an already-competent subgoal-following worker, then train the
+        manager on top of it (collapses the HIRO cold-start)."""
+        self.nets.worker_actor.load_state_dict(sd["worker_actor"])
+        self.nets.worker_critic.load_state_dict(sd["worker_critic"])
+        self.worker_critic_target.load_state_dict(sd["worker_critic_target"])
+        with torch.no_grad():
+            self.log_alpha_low.copy_(sd["log_alpha_low"].to(self.device))

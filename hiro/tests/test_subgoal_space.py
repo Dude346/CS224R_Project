@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from hiro.subgoal_space import (
+    CUBE_CENTRIC_SUBGOAL_SPACES,
     GRASP_DETECTORS,
     HIRO_SUBGOAL_SPACES,
     ObsBitGraspReader,
@@ -440,3 +441,91 @@ class TestGraspReaders:
         ])
         g = det(obs)
         assert torch.equal(g, torch.tensor([False, False, True]))
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: cube-centric (object-only) subgoal — kills the Test-G hover hack.
+#
+# The hover hack: with the tcp+object subgoal, the worker can farm the
+# always-on hand_term by moving the GRIPPER to its target without ever
+# grasping. The cube-centric space has NO hand dims (object_dims = all dims),
+# so hand_term == 0 and the only intrinsic reward is the grasp-gated cube term
+# (+ PBRS). A not-grasped hovering policy therefore earns nothing.
+# ---------------------------------------------------------------------------
+
+class TestCubeCentricHoverHack:
+    GAMMA, ALPHA = 0.8, 0.5
+
+    @pytest.fixture
+    def cc(self) -> SubgoalSpace:
+        return CUBE_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]   # indices [29,30,31], object_dims (0,1,2)
+
+    def test_partition_has_no_hand_dims(self, cc):
+        assert cc.dim == 3
+        assert cc.hand_positions == []           # nothing to farm
+        assert list(cc.object_positions) == [0, 1, 2]
+
+    def test_not_grasped_hovering_earns_zero(self, cc):
+        # Cube fixed, gripper (obs[19:22]) moves a lot, NOT grasped -> reward ~0.
+        s, s_next = torch.zeros(1, 42), torch.zeros(1, 42)
+        s[0, 29:32] = torch.tensor([0.10, 0.20, 0.30])
+        s_next[0, 29:32] = torch.tensor([0.10, 0.20, 0.30])   # cube didn't move
+        s[0, 19:22] = torch.tensor([0.0, 0.0, 0.0])
+        s_next[0, 19:22] = torch.tensor([0.5, 0.4, 0.3])      # gripper moved a lot
+        g = torch.tensor([[0.1, 0.0, 0.0]])
+        r = cc.phased_pbrs_intrinsic_reward(
+            s, g, s_next, torch.zeros(1), torch.zeros(1), gamma=self.GAMMA, alpha=self.ALPHA)
+        assert abs(r.item()) < 1e-6
+
+    def test_reward_is_invariant_to_gripper_when_not_grasped(self, cc):
+        # Two transitions identical in cube/grasp but different gripper motion
+        # must yield the IDENTICAL reward (no hand term to exploit).
+        def reward_with_tcp(tcp_next):
+            s, sn = torch.zeros(1, 42), torch.zeros(1, 42)
+            s[0, 29:32] = torch.tensor([0.2, 0.0, 0.0]); sn[0, 29:32] = torch.tensor([0.2, 0.0, 0.0])
+            sn[0, 19:22] = torch.tensor(tcp_next)
+            g = torch.zeros(1, 3)
+            return cc.phased_pbrs_intrinsic_reward(
+                s, g, sn, torch.zeros(1), torch.zeros(1), gamma=self.GAMMA, alpha=self.ALPHA).item()
+        assert reward_with_tcp([0.5, 0.0, 0.0]) == pytest.approx(reward_with_tcp([0.0, 0.0, 0.0]))
+
+    def test_old_space_IS_farmable_cube_centric_is_NOT(self, cc):
+        # Same physical situation: gripper moves toward its tcp-target, cube fixed,
+        # NOT grasped. OLD (tcp+cube) space rewards the gripper motion (farmable);
+        # cube-centric does not.
+        old = HIRO_SUBGOAL_SPACES["PickCube-v1"]   # indices [19,20,21,29,30,31]
+        s = torch.zeros(1, 42)
+        s[0, 19:22] = torch.tensor([0.0, 0.0, 0.0])    # tcp
+        s[0, 29:32] = torch.tensor([0.2, 0.0, 0.0])    # cube
+        moved, stay = torch.zeros(1, 42), torch.zeros(1, 42)
+        for t in (moved, stay):
+            t[0, 29:32] = torch.tensor([0.2, 0.0, 0.0])    # cube fixed in both
+        moved[0, 19:22] = torch.tensor([0.1, 0.0, 0.0])    # gripper moved toward tcp target
+        stay[0, 19:22] = torch.tensor([0.0, 0.0, 0.0])     # gripper stayed
+        g_old = torch.tensor([[0.1, 0.0, 0.0, 0.0, 0.0, 0.0]])   # tcp target +0.1x, cube 0
+        ig0 = torch.zeros(1)
+        r_old_moved = old.phased_pbrs_intrinsic_reward(s, g_old, moved, ig0, ig0, gamma=self.GAMMA, alpha=self.ALPHA).item()
+        r_old_stay  = old.phased_pbrs_intrinsic_reward(s, g_old, stay,  ig0, ig0, gamma=self.GAMMA, alpha=self.ALPHA).item()
+        assert r_old_moved != pytest.approx(r_old_stay)   # OLD: gripper motion is rewarded -> farmable
+        g_cc = torch.zeros(1, 3)
+        r_cc_moved = cc.phased_pbrs_intrinsic_reward(s, g_cc, moved, ig0, ig0, gamma=self.GAMMA, alpha=self.ALPHA).item()
+        r_cc_stay  = cc.phased_pbrs_intrinsic_reward(s, g_cc, stay,  ig0, ig0, gamma=self.GAMMA, alpha=self.ALPHA).item()
+        assert r_cc_moved == pytest.approx(r_cc_stay)     # cube-centric: gripper motion irrelevant -> NOT farmable
+
+    def test_grasped_rewards_cube_progress(self, cc):
+        # When grasped, moving the cube toward the commanded target scores higher
+        # than leaving it put (cube term is active).
+        s = torch.zeros(1, 42); s[0, 29:32] = torch.tensor([0.0, 0.0, 0.0])
+        g = torch.tensor([[0.1, 0.0, 0.0]])                # target = cube + g = [0.1,0,0]
+        reached, stay = torch.zeros(1, 42), torch.zeros(1, 42)
+        reached[0, 29:32] = torch.tensor([0.1, 0.0, 0.0])  # cube reached target -> residual 0
+        stay[0, 29:32] = torch.tensor([0.0, 0.0, 0.0])     # cube didn't move -> residual 0.1
+        one = torch.ones(1)
+        r_reached = cc.phased_pbrs_intrinsic_reward(s, g, reached, one, one, gamma=self.GAMMA, alpha=self.ALPHA).item()
+        r_stay    = cc.phased_pbrs_intrinsic_reward(s, g, stay,    one, one, gamma=self.GAMMA, alpha=self.ALPHA).item()
+        assert r_reached > r_stay
+
+    def test_get_subgoal_space_mode_switch(self):
+        assert get_subgoal_space("PickCube-v1", "cube_centric").dim == 3
+        assert get_subgoal_space("PickCube-v1").dim == 6        # default unchanged
+        assert get_subgoal_space("PickCube-v1", "hiro").dim == 6

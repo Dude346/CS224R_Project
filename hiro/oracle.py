@@ -23,7 +23,7 @@ PICKCUBE_LAYOUT = {"tcp": (19, 22), "obj": (29, 32), "goal": (26, 29)}
 STACKCUBE_LAYOUT = {"tcp": (18, 21), "obj": (25, 28), "goal": (32, 35)}
 
 
-def make_oracle(env_id: str, scale: float, grasp_detector):
+def make_oracle(env_id: str, scale: float, grasp_detector, cube_only: bool = False):
     """Return an oracle subgoal function: obs (B, obs_dim) -> g (B, subgoal_dim).
 
     Pre-grasp:  g_tcp = (cube - tcp);              g_obj = 0  (cube can't be moved anyway)
@@ -32,6 +32,9 @@ def make_oracle(env_id: str, scale: float, grasp_detector):
     Each component is clamped per-dim to ±scale so the magnitude matches what a
     learned manager would ever output. For StackCube we add a small +z lift to
     the goal so cubeA targets above cubeB, not into it.
+
+    cube_only=True (Phase 5 cube-centric mode): return ONLY the object subgoal
+    g_obj (B, 3) -- matches the cube-only subgoal space (no TCP dims).
     """
     if env_id == "PickCube-v1":
         layout = PICKCUBE_LAYOUT
@@ -56,6 +59,8 @@ def make_oracle(env_id: str, scale: float, grasp_detector):
         is_grasped = grasp_detector(obs).to(obs.dtype).unsqueeze(-1)
         g_tcp = obj - tcp                         # always aim TCP at the object
         g_obj = is_grasped * (goal - obj)         # only set object subgoal once grasped
+        if cube_only:
+            return g_obj.clamp(-s, s)             # (B, 3) cube-centric subgoal space
         g = torch.cat([g_tcp, g_obj], dim=-1)     # (B, 6)
         return g.clamp(-s, s)
 

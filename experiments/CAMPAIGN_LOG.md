@@ -66,6 +66,14 @@ Mined worker exploration + reward-decomposition tags across all screens:
 4. Pretrained worker low/alpha=0.001 flat (near-deterministic from load) yet competent; mean_manager_reward ->2.26 (~2x from-scratch's ~1.0). Same ~0 exploration, opposite grasp (95% vs 2-3%) => discriminator is converged-policy QUALITY (reward landscape), not exploration level.
 CONCLUSION: from-scratch wall = hover-hackable reward. Phase 5 (cube-centric) is the principled fix; its running screens are the direct test (watch grasp_rate + mean_intrinsic_reward rise together).
 
+## MILESTONE: FIRST FULLY-LEARNED SOLVE -- M2 (no off-policy correction) [2026-06-01]
+M2 = cube-centric, w=0.5, learned manager + learned worker, **off-policy correction OFF**, 300k.
+RESULT: success 0.875@250k -> **1.000@275k & 300k**, reward 0.773, place_dist 0.066, cube@goal 0.70. FIRST fully LEARNED (no-oracle, no privileged info) solve of the campaign (all prior learned configs plateaued ~0.47/0).
+sg_align ROSE as it converged: +0.13(250k)->+0.235(275k)->+0.247(300k) -- the no-OPC manager gets MORE engaged (vs correction-ON runs which faded to ~0).
+CAUSE = removing the off-policy correction. M1 (same + 4x manager UTD but correction ON) stuck at reward ~0.42, success 0, sg_align -0.28. => HIRO's subgoal-relabeling was ACTIVELY HARMING (teaching the manager to mimic the worker, not lead). Turning it off unlocked the solve. UTD irrelevant.
+CALIBRATION: solves at w=0.5 with sg_align ~0.25 (<< oracle 0.83), so the manager is PARTIALLY steering; env reward still shares the load. Not yet a w=0 load-bearing claim.
+NEXT (decisive + reshaped): (1) anneal w->0 WITH no-OPC -- the earlier "not load-bearing" verdict used correction-ON runs; now very promising. (2) TRANSFER on the LEARNED M2 source (no oracle needed -- much stronger thesis claim).
+
 ## ANNEAL VERDICT (Exp 1 to w->0) -- REFINED with 1a w=0 endpoint [2026-05-31]
 CORRECTION to earlier "leans fundamental": 1a's w=0 endpoint = sg_align +0.282 (ABOVE +0.2), grasp 0.75, place_dist 0.172, reward 0.30, success 0. So the worker STILL FOLLOWS the learned manager at w=0 => manager is GENUINELY (weakly) LOAD-BEARING, not a passenger. But performance DEGRADES as w->0 (grasp 1.0->0.75, place_dist best 0.115@w~0.3 -> 0.172@w0, reward 0.45->0.30, never solves). 1b (+place-PBRS) WORSE (sg_align +0.125, grasp 0.50) -> place-PBRS hurt.
 REFINED VERDICT: neither clean-fundamental nor clean-phase-separable. The learned hierarchy is REAL (manager followed at w=0) but the learned manager's SUBGOAL QUALITY is too low to run the task alone; peak is an intermediate sweet spot (~w=0.3). Combined with oracle (sg_align 0.83 -> 100% solve): worker fully capable, manager weakly load-bearing, manager subgoal QUALITY is the single remaining gap.

@@ -322,7 +322,9 @@ GRASP_DETECTORS: dict[str, GraspReader] = {
     "PickCube-v1": ObsBitGraspReader(obs_index=18),
     # StackCube has no explicit grasp bit in obs_mode="state", so use the
     # embodiment-independent positional heuristic for cubeA.
-    "StackCube-v1": PositionalGraspDetector(tcp_to_obj_indices=(39, 40, 41), obj_z_index=27),
+    # lift_threshold lowered 0.035->0.025 (cubeA rest center z=0.02): detect a grasp when
+    # cubeA is lifted even slightly, so the cube-only oracle's grasp-gated stack target fires.
+    "StackCube-v1": PositionalGraspDetector(tcp_to_obj_indices=(39, 40, 41), obj_z_index=27, lift_threshold=0.025),
 }
 
 

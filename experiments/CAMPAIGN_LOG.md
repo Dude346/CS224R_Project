@@ -66,6 +66,21 @@ Mined worker exploration + reward-decomposition tags across all screens:
 4. Pretrained worker low/alpha=0.001 flat (near-deterministic from load) yet competent; mean_manager_reward ->2.26 (~2x from-scratch's ~1.0). Same ~0 exploration, opposite grasp (95% vs 2-3%) => discriminator is converged-policy QUALITY (reward landscape), not exploration level.
 CONCLUSION: from-scratch wall = hover-hackable reward. Phase 5 (cube-centric) is the principled fix; its running screens are the direct test (watch grasp_rate + mean_intrinsic_reward rise together).
 
+## STACKCUBE SCOUT CAMPAIGN [2026-06-01]
+Question: does a MULTI-STAGE task make the learned manager load-bearing (sg_align climbs >> PickCube's ~0.25 toward the oracle ceiling, holds as w->0)? F10 predicts yes. SCOUT before building the full matrix; gating metric = sg_align (NOT reward).
+- **Exp 0 (FIRST, plumbing + ceiling):** oracle StackCube = cube_only oracle + cube-centric subgoal + w=0.5, 1M. Validate release / grasp heuristic / stack detector / staged subgoal; establish the sg_align ceiling. MUST SOLVE before any learned run is interpretable. LAUNCHED hiro_stk_E0_oracle_cubeCentric_w50_seed1_1M. Watch: success/stack-rate, release works?, cubeA->cubeB place_dist drops, oracle sg_align (~0.8 expected). Likely-bug to watch: positional grasp heuristic may falsely read "grasped" when cubeA rests ON cubeB (both elevated).
+- **Exp 1 (GATED on Exp0 solve):** M2 recipe from scratch on StackCube (cube-centric, no-OPC, w=0.5, g08, ~1M). sg_align vs ceiling vs 0.25 = THE answer. >=0.4 sustained -> commit matrix; ~0.25 -> sharper negative.
+- **Exp 2 (GATED on Exp1 promising):** w-anneal 0.5->0 on StackCube (does sg_align hold >=+0.2 = load-bearing).
+- **PARALLEL (non-negotiable):** 3-seed M2 PickCube reproduction. LAUNCHED seed2 + seed3 (seed1=M2, already solved 100%). Report seeds-solving /3 + reward/success spread.
+- **Full matrix: DO NOT BUILD until Exp1/2 green-light.**
+
+## E2 VERDICT: no-OPC manager is STILL not load-bearing (anneal w->0 collapses) [2026-06-01]
+E2 = cube-centric, no-OPC, anneal w 0.5->0, 300k. Anneal triggered @115k. As w->0: grasp COLLAPSED 1.0->0.31, reward 0.40->0.21, sg_align never sustained >=+0.2 (one blip +0.27@w0.34, ended ~0), NEVER solved.
+DECISIVE COMPARISON: M2 (no-OPC, CONSTANT w=0.5) solves 100%; E2 (no-OPC, ANNEAL w->0) collapses. Same code, only diff = env reward stays on or not. => M2's solve was ENV-DRIVEN; the manager was a passenger. Removing the off-policy correction removed ACTIVE HARM (M1 correction-ON: sg_align -0.38, manager pointed away from goal, disrupting worker) but did NOT create a load-bearing manager.
+FINAL load-bearing verdict: **learned manager is NOT load-bearing on PickCube, confirmed both WITH and WITHOUT the off-policy correction.** Env reward is load-bearing for grasp-maintenance AND transport. Consistent with PickCube being single-stage (manager adds little).
+STANDING: validated = cube-centric fixes hover-hack + off-policy correction harmful (reportable). Real result = from-scratch object-centric HIRO solves PickCube 100% (M2) but env-driven. NOT achieved = load-bearing learned manager on PickCube.
+NEXT: StackCube (multi-stage -> manager decomposition should matter; infra wired) is the venue to actually vindicate the hierarchy; transfer on M2 source (weaker claim); or oracle distillation (uses oracle).
+
 ## MILESTONE: FIRST FULLY-LEARNED SOLVE -- M2 (no off-policy correction) [2026-06-01]
 M2 = cube-centric, w=0.5, learned manager + learned worker, **off-policy correction OFF**, 300k.
 RESULT: success 0.875@250k -> **1.000@275k & 300k**, reward 0.773, place_dist 0.066, cube@goal 0.70. FIRST fully LEARNED (no-oracle, no privileged info) solve of the campaign (all prior learned configs plateaued ~0.47/0).

@@ -302,6 +302,40 @@ class TestUpdates:
             assert all(torch.isfinite(torch.tensor(v)) for v in lo.values())
             assert all(torch.isfinite(torch.tensor(v)) for v in hi.values())
 
+    def test_apply_low_her_relabels_subgoal_and_reward(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(action_dim=ACT, c=5, subgoal_scale=SCALE, device="cpu")
+        ag = HIROAgent(sp, cfg)
+        ag.grasp_detector = lambda obs: obs[..., 18] > 0.5
+
+        obs = torch.zeros(2, OBS)
+        next_obs = torch.zeros(2, OBS)
+        obs[0, 36] = 0.20
+        next_obs[0, 36] = 0.10
+        # Make sample 0 have a future achieved object-centric state.
+        future_obs = torch.zeros(2, OBS)
+        future_obs[0, 36] = 0.05
+        future_obs[0, 39] = 0.10
+        batch = LowLevelSample(
+            obs=obs,
+            subgoal=torch.zeros(2, SG),
+            action=torch.zeros(2, ACT),
+            reward=torch.zeros(2),
+            next_obs=next_obs,
+            next_subgoal=torch.zeros(2, SG),
+            done=torch.zeros(2),
+        )
+        mask = torch.tensor([True, False])
+        relabeled = ag.apply_low_her(batch, future_obs, mask)
+        expected_g0 = sp.project(future_obs[0:1]) - sp.project(obs[0:1])
+        assert torch.allclose(relabeled.subgoal[0:1], expected_g0)
+        assert torch.allclose(relabeled.subgoal[1], batch.subgoal[1])
+        expected_next = ag.subgoal_transition(obs[0:1], expected_g0, next_obs[0:1])
+        assert torch.allclose(relabeled.next_subgoal[0:1], expected_next)
+        expected_reward = ag.worker_reward(obs[0:1], expected_g0, next_obs[0:1])
+        assert torch.allclose(relabeled.reward[0:1], expected_reward)
+        assert relabeled.reward[0].item() != ag.worker_reward(obs[0:1], batch.subgoal[0:1], next_obs[0:1]).item()
+
 
 # ---------------------------------------------------------------------------
 # Target networks

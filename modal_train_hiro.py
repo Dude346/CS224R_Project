@@ -55,6 +55,7 @@ def train_hiro(
     use_off_policy_correction: bool = True,
     use_phased_reward: bool = True,
     pbrs_alpha: float = 0.1,
+    low_her_ratio: float = 0.8,
     latent_subgoal_dim: int = 6,
     partial_reset: bool = False,
     track: bool = False,
@@ -90,6 +91,7 @@ def train_hiro(
         use_off_policy_correction=use_off_policy_correction,
         use_phased_reward=use_phased_reward,
         pbrs_alpha=pbrs_alpha,
+        low_her_ratio=low_her_ratio,
         latent_subgoal_dim=latent_subgoal_dim,
         partial_reset=partial_reset,
         track=track,
@@ -150,6 +152,7 @@ def main(
     low_buffer_size: int = 100_000,
     high_buffer_size: int = 20_000,
     use_off_policy_correction: bool = True,
+    low_her_ratio: float = 0.8,
     latent_subgoal_dim: int = 6,
     track: bool = False,
 ):
@@ -169,6 +172,7 @@ def main(
         low_buffer_size=low_buffer_size,
         high_buffer_size=high_buffer_size,
         use_off_policy_correction=use_off_policy_correction,
+        low_her_ratio=low_her_ratio,
         latent_subgoal_dim=latent_subgoal_dim,
         track=track,
     )
@@ -193,6 +197,7 @@ def launch(
     c: int = 10,
     subgoal_scale: float = 0.15,
     use_off_policy_correction: bool = True,
+    low_her_ratio: float = 0.8,
     latent_subgoal_dim: int = 6,
     track: bool = True,
 ):
@@ -207,6 +212,7 @@ def launch(
         c=c,
         subgoal_scale=subgoal_scale,
         use_off_policy_correction=use_off_policy_correction,
+        low_her_ratio=low_her_ratio,
         latent_subgoal_dim=latent_subgoal_dim,
         track=track,
     )

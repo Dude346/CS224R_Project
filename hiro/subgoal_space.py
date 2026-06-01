@@ -38,9 +38,10 @@ Latent object-centric:
   manager/worker communicate through a learned low-dimensional latent code.
   Reward and goal-transition math still happen in the geometric base space.
 
-The indices assume obs_mode="state" with pd_joint_delta_pos control and
-the standard Panda agent.  Run modal_verify_subgoal_space.py to confirm
-before training.
+For ManiSkill `obs_mode="state"`, the task-specific "extra" block lives at the
+tail of the observation and has a fixed layout per task. We derive indices from
+`obs_dim`, so the same object-centric path works across robots/grippers whose
+agent-state prefix has a different size.
 """
 from __future__ import annotations
 
@@ -72,6 +73,9 @@ class SubgoalSpace:
     # the worker can only affect AFTER it has grasped the object. Empty => every dim
     # is always active (plain HIRO behaviour used by the original tests).
     object_dims: tuple[int, ...] = ()
+    reward_mode: str = "intrinsic"
+    qvel_slice: tuple[int, int] | None = None
+    task_obs_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.indices:
@@ -87,6 +91,17 @@ class SubgoalSpace:
         bad_obj = [d for d in self.object_dims if not (0 <= d < dim)]
         if bad_obj:
             raise ValueError(f"object_dims {bad_obj} out of range for subgoal dim={dim}")
+        if self.qvel_slice is not None:
+            qvel_start, qvel_end = self.qvel_slice
+            if not (0 <= qvel_start <= qvel_end <= self.obs_dim):
+                raise ValueError(
+                    f"qvel_slice {self.qvel_slice} out of range for obs_dim={self.obs_dim}"
+                )
+        bad_task = [i for i in self.task_obs_indices if not (0 <= i < self.obs_dim)]
+        if bad_task:
+            raise ValueError(
+                f"task_obs_indices {bad_task} out of range for obs_dim={self.obs_dim}"
+            )
         obj = set(self.object_dims)
         self.object_positions = list(self.object_dims)            # grasp-gated dims
         self.hand_positions = [i for i in range(dim) if i not in obj]  # always-active dims
@@ -257,8 +272,9 @@ class SubgoalSpace:
                 place_score = 1.0 - torch.tanh(tanh_temp * place_dist)
                 phi = phi + place_coef * grasp * place_score
                 qvel = proj.new_zeros(place_dist.shape)
-                if obs.shape[-1] >= 18:
-                    qvel = torch.norm(obs[..., 9:18], dim=-1)
+                if self.qvel_slice is not None:
+                    qvel_start, qvel_end = self.qvel_slice
+                    qvel = torch.norm(obs[..., qvel_start:qvel_end], dim=-1)
                 static_score = 1.0 - torch.tanh(static_temp * qvel)
                 phi = phi + settle_coef * grasp * place_score * static_score
             return phi
@@ -324,83 +340,153 @@ class SubgoalSpace:
 # Indices verified against ManiSkill3 source (pick_cube.py / stack_cube.py)
 # and confirmed by modal_verify_subgoal_space.py.
 #
-# PickCube-v1 flat obs layout (42 dims, obs_mode="state"):
-#   [0:9]   agent.qpos
-#   [9:18]  agent.qvel
-#   [18]    extra.is_grasped
-#   [19:26] extra.tcp_pose  -> [19:22] xyz  [22:26] quaternion
-#   [26:29] extra.goal_pos  (fixed per episode)
-#   [29:36] extra.obj_pose  -> [29:32] xyz  [32:36] quaternion
-#   [36:39] extra.tcp_to_obj_pos
-#   [39:42] extra.obj_to_goal_pos
+# PickCube extra tail (24 dims, obs_mode="state"):
+#   [0]     extra.is_grasped
+#   [1:8]   extra.tcp_pose  -> [1:4] xyz
+#   [8:11]  extra.goal_pos
+#   [11:18] extra.obj_pose  -> [11:14] xyz
+#   [18:21] extra.tcp_to_obj_pos
+#   [21:24] extra.obj_to_goal_pos
 #
-# StackCube-v1 flat obs layout (48 dims, obs_mode="state"):
-#   [0:9]   agent.qpos
-#   [9:18]  agent.qvel
-#   [18:25] extra.tcp_pose  -> [18:21] xyz  [21:25] quaternion
-#   [25:32] extra.cubeA_pose -> [25:28] xyz [28:32] quaternion
-#   [32:39] extra.cubeB_pose -> [32:35] xyz [35:39] quaternion
-#   [39:42] extra.tcp_to_cubeA_pos
-#   [42:45] extra.tcp_to_cubeB_pos
-#   [45:48] extra.cubeA_to_cubeB_pos
+# StackCube extra tail (30 dims, obs_mode="state"):
+#   [0:7]   extra.tcp_pose  -> [0:3] xyz
+#   [7:14]  extra.cubeA_pose -> [7:10] xyz
+#   [14:21] extra.cubeB_pose -> [14:17] xyz
+#   [21:24] extra.tcp_to_cubeA_pos
+#   [24:27] extra.tcp_to_cubeB_pos
+#   [27:30] extra.cubeA_to_cubeB_pos
 # ---------------------------------------------------------------------------
 
+PICKCUBE_EXTRA_DIM = 24
+STACKCUBE_EXTRA_DIM = 30
+
+
+def _infer_agent_layout(obs_dim: int, task_tail_dim: int) -> tuple[int, tuple[int, int]]:
+    """Infer the agent-state prefix size and its qvel slice.
+
+    ManiSkill `obs_mode="state"` for these tasks is `[agent.qpos, agent.qvel, extra...]`.
+    Across the grippers/robots we care about, qpos and qvel contribute equally-sized
+    prefixes, so the fixed-size task tail lets us recover the qvel slice from `obs_dim`.
+    """
+    agent_dim = obs_dim - task_tail_dim
+    if agent_dim <= 0 or agent_dim % 2 != 0:
+        raise ValueError(
+            f"obs_dim={obs_dim} is incompatible with task tail {task_tail_dim}; "
+            "expected an even-sized [qpos, qvel] prefix."
+        )
+    qvel_start = agent_dim // 2
+    return agent_dim, (qvel_start, agent_dim)
+
+
+def _pickcube_layout(obs_dim: int) -> dict[str, object]:
+    agent_dim, qvel_slice = _infer_agent_layout(obs_dim, PICKCUBE_EXTRA_DIM)
+    base = agent_dim
+    return dict(
+        obs_dim=obs_dim,
+        qvel_slice=qvel_slice,
+        task_obs_indices=tuple(range(base, obs_dim)),
+        is_grasped=base,
+        tcp_xyz=[base + 1, base + 2, base + 3],
+        obj_xyz=[base + 11, base + 12, base + 13],
+        tcp_to_obj=[base + 18, base + 19, base + 20],
+        obj_to_goal=[base + 21, base + 22, base + 23],
+    )
+
+
+def _stackcube_layout(obs_dim: int) -> dict[str, object]:
+    agent_dim, qvel_slice = _infer_agent_layout(obs_dim, STACKCUBE_EXTRA_DIM)
+    base = agent_dim
+    return dict(
+        obs_dim=obs_dim,
+        qvel_slice=qvel_slice,
+        task_obs_indices=tuple(range(base, obs_dim)),
+        tcp_xyz=[base + 0, base + 1, base + 2],
+        cubeA_xyz=[base + 7, base + 8, base + 9],
+        tcp_to_cubeA=[base + 21, base + 22, base + 23],
+        tcp_to_cubeB=[base + 24, base + 25, base + 26],
+        cubeA_to_cubeB=[base + 27, base + 28, base + 29],
+        cubeA_z=base + 9,
+    )
+
+
+def _build_subgoal_space(env_id: str, variant: str, obs_dim: int) -> SubgoalSpace:
+    if env_id == "PickCube-v1":
+        layout = _pickcube_layout(obs_dim)
+        if variant == "absolute":
+            return SubgoalSpace(
+                indices=[*layout["tcp_xyz"], *layout["obj_xyz"]],
+                obs_dim=obs_dim,
+                label="tcp_xyz+cube_xyz",
+                object_dims=(3, 4, 5),
+                qvel_slice=layout["qvel_slice"],
+                task_obs_indices=layout["task_obs_indices"],
+            )
+        if variant == "hybrid":
+            return SubgoalSpace(
+                indices=[*layout["tcp_xyz"], *layout["tcp_to_obj"], *layout["obj_to_goal"]],
+                obs_dim=obs_dim,
+                label="tcp_xyz+tcp_to_obj+obj_to_goal",
+                object_dims=(6, 7, 8),
+                qvel_slice=layout["qvel_slice"],
+                task_obs_indices=layout["task_obs_indices"],
+            )
+        if variant in {"object_centric", "latent_object_centric"}:
+            return SubgoalSpace(
+                indices=[*layout["tcp_to_obj"], *layout["obj_to_goal"]],
+                obs_dim=obs_dim,
+                label="tcp_to_obj+obj_to_goal",
+                object_dims=(3, 4, 5),
+                reward_mode="pickcube_task_potential",
+                qvel_slice=layout["qvel_slice"],
+                task_obs_indices=layout["task_obs_indices"],
+            )
+    elif env_id == "StackCube-v1":
+        layout = _stackcube_layout(obs_dim)
+        if variant == "absolute":
+            return SubgoalSpace(
+                indices=[*layout["tcp_xyz"], *layout["cubeA_xyz"]],
+                obs_dim=obs_dim,
+                label="tcp_xyz+cubeA_xyz",
+                object_dims=(3, 4, 5),
+                qvel_slice=layout["qvel_slice"],
+                task_obs_indices=layout["task_obs_indices"],
+            )
+        if variant == "hybrid":
+            return SubgoalSpace(
+                indices=[*layout["tcp_xyz"], *layout["tcp_to_cubeA"], *layout["cubeA_to_cubeB"]],
+                obs_dim=obs_dim,
+                label="tcp_xyz+tcp_to_cubeA+cubeA_to_cubeB",
+                object_dims=(6, 7, 8),
+                qvel_slice=layout["qvel_slice"],
+                task_obs_indices=layout["task_obs_indices"],
+            )
+        if variant in {"object_centric", "latent_object_centric"}:
+            return SubgoalSpace(
+                indices=[*layout["tcp_to_cubeA"], *layout["cubeA_to_cubeB"]],
+                obs_dim=obs_dim,
+                label="tcp_to_cubeA+cubeA_to_cubeB",
+                object_dims=(3, 4, 5),
+                qvel_slice=layout["qvel_slice"],
+                task_obs_indices=layout["task_obs_indices"],
+            )
+    raise ValueError(
+        f"No {variant} subgoal space defined for {env_id!r}. "
+        f"Known envs: ['PickCube-v1', 'StackCube-v1']"
+    )
+
 HIRO_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
-    "PickCube-v1": SubgoalSpace(
-        indices=[19, 20, 21,   # tcp_xyz  : extra.tcp_pose[:3]  starts at obs[19]  (HAND)
-                 29, 30, 31],  # cube_xyz : extra.obj_pose[:3]  starts at obs[29]  (OBJECT)
-        obs_dim=42,
-        label="tcp_xyz+cube_xyz",
-        object_dims=(3, 4, 5),  # cube dims are grasp-gated (worker can't move cube pre-grasp)
-    ),
-    "StackCube-v1": SubgoalSpace(
-        indices=[18, 19, 20,   # tcp_xyz   : extra.tcp_pose[:3]   starts at obs[18]  (HAND)
-                 25, 26, 27],  # cubeA_xyz : extra.cubeA_pose[:3] starts at obs[25]  (OBJECT)
-        # cubeB_xyz (obs[32:35]) deliberately EXCLUDED: cubeB is the static target
-        # and never moves. Including it would put a flat -||g_cubeB|| penalty into
-        # the worker reward that no action can ever reduce (the same pathology that
-        # blocked v1-v3). cubeB position is still in obs, so the manager can still
-        # condition on "where to place cubeA"; it just isn't a subgoal dim.
-        obs_dim=48,
-        label="tcp_xyz+cubeA_xyz",
-        object_dims=(3, 4, 5),  # cubeA dims are grasp-gated
-    ),
+    "PickCube-v1": _build_subgoal_space("PickCube-v1", "absolute", obs_dim=42),
+    "StackCube-v1": _build_subgoal_space("StackCube-v1", "absolute", obs_dim=48),
 }
 
 OBJECT_CENTRIC_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
-    "PickCube-v1": SubgoalSpace(
-        indices=[36, 37, 38,   # tcp_to_obj_pos : extra.tcp_to_obj_pos
-                 39, 40, 41],  # obj_to_goal_pos: extra.obj_to_goal_pos
-        obs_dim=42,
-        label="tcp_to_obj+obj_to_goal",
-        object_dims=(3, 4, 5),  # obj_to_goal dims matter only once the cube is controlled
-    ),
-    "StackCube-v1": SubgoalSpace(
-        indices=[39, 40, 41,   # tcp_to_cubeA_pos : extra.tcp_to_cubeA_pos
-                 45, 46, 47],  # cubeA_to_cubeB_pos: extra.cubeA_to_cubeB_pos
-        obs_dim=48,
-        label="tcp_to_cubeA+cubeA_to_cubeB",
-        object_dims=(3, 4, 5),  # cubeA->cubeB placement dims are grasp-gated
-    ),
+    "PickCube-v1": _build_subgoal_space("PickCube-v1", "object_centric", obs_dim=42),
+    "StackCube-v1": _build_subgoal_space("StackCube-v1", "object_centric", obs_dim=48),
 }
 
 HYBRID_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
-    "PickCube-v1": SubgoalSpace(
-        indices=[19, 20, 21,   # tcp_xyz        : extra.tcp_pose[:3]
-                 36, 37, 38,   # tcp_to_obj_pos : extra.tcp_to_obj_pos
-                 39, 40, 41],  # obj_to_goal_pos: extra.obj_to_goal_pos
-        obs_dim=42,
-        label="tcp_xyz+tcp_to_obj+obj_to_goal",
-        object_dims=(6, 7, 8),  # only the object->goal transport dims are grasp-gated
-    ),
-    "StackCube-v1": SubgoalSpace(
-        indices=[18, 19, 20,   # tcp_xyz          : extra.tcp_pose[:3]
-                 39, 40, 41,   # tcp_to_cubeA_pos : extra.tcp_to_cubeA_pos
-                 45, 46, 47],  # cubeA_to_cubeB   : extra.cubeA_to_cubeB_pos
-        obs_dim=48,
-        label="tcp_xyz+tcp_to_cubeA+cubeA_to_cubeB",
-        object_dims=(6, 7, 8),  # placement/transport dims are grasp-gated
-    ),
+    "PickCube-v1": _build_subgoal_space("PickCube-v1", "hybrid", obs_dim=42),
+    "StackCube-v1": _build_subgoal_space("StackCube-v1", "hybrid", obs_dim=48),
 }
 
 SUBGOAL_SPACE_VARIANTS: dict[str, dict[str, SubgoalSpace]] = {
@@ -476,21 +562,34 @@ class PositionalGraspDetector:
 
 
 GRASP_DETECTORS: dict[str, GraspReader] = {
-    # PickCube exposes the true task grasp bit at obs[18]; use it directly.
-    "PickCube-v1": ObsBitGraspReader(obs_index=18),
-    # StackCube has no explicit grasp bit in obs_mode="state", so use the
-    # embodiment-independent positional heuristic for cubeA.
-    "StackCube-v1": PositionalGraspDetector(tcp_to_obj_indices=(39, 40, 41), obj_z_index=27),
+    "PickCube-v1": ObsBitGraspReader(obs_index=_pickcube_layout(42)["is_grasped"]),
+    "StackCube-v1": PositionalGraspDetector(
+        tcp_to_obj_indices=tuple(_stackcube_layout(48)["tcp_to_cubeA"]),
+        obj_z_index=_stackcube_layout(48)["cubeA_z"],
+    ),
 }
 
 
-def get_grasp_detector(env_id: str) -> "GraspReader | None":
-    return GRASP_DETECTORS.get(env_id)
+def get_grasp_detector(env_id: str, obs_dim: int | None = None) -> "GraspReader | None":
+    if obs_dim is None:
+        return GRASP_DETECTORS.get(env_id)
+    if env_id == "PickCube-v1":
+        layout = _pickcube_layout(obs_dim)
+        return ObsBitGraspReader(obs_index=layout["is_grasped"])
+    if env_id == "StackCube-v1":
+        layout = _stackcube_layout(obs_dim)
+        return PositionalGraspDetector(
+            tcp_to_obj_indices=tuple(layout["tcp_to_cubeA"]),
+            obj_z_index=layout["cubeA_z"],
+        )
+    return None
 
 
-def get_subgoal_space(env_id: str, variant: str = "absolute") -> SubgoalSpace:
+def get_subgoal_space(env_id: str, variant: str = "absolute", obs_dim: int | None = None) -> SubgoalSpace:
     """Return the requested HIRO subgoal space for the given env."""
     variant_key = normalize_subgoal_variant(variant)
+    if obs_dim is not None:
+        return _build_subgoal_space(env_id, variant_key, obs_dim=obs_dim)
     spaces = SUBGOAL_SPACE_VARIANTS[variant_key]
     if env_id not in spaces:
         raise ValueError(

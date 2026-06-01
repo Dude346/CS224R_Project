@@ -61,6 +61,7 @@ class TrainArgs:
     latent_subgoal_dim: int = 6        # only used by latent_object_centric; 6 == base
                                        # object-centric dim, so no lossy compression
                                        # (drop below 6 only to deliberately bottleneck)
+    low_her_ratio: float = 0.8         # fraction of sampled worker transitions relabeled with future HER
     # partial_reset=True: episodes end on TRUE termination (env success), not just
     # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
     # success). Flat SAC baselines used False to match upstream.
@@ -92,7 +93,7 @@ def build_envs(args: TrainArgs, run_name: str):
     from mani_skill.utils.wrappers.record import RecordEpisode
     from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
-    if args.robot_uids != "panda":
+    if "panda" in args.robot_uids and not args.robot_uids.startswith("panda"):
         import weak_panda  # noqa: F401 — registers custom robots on import
 
     env_kwargs = dict(
@@ -196,7 +197,7 @@ def train(args: TrainArgs) -> str:
     low = np.asarray(envs.single_action_space.low).reshape(-1)
     high = np.asarray(envs.single_action_space.high).reshape(-1)
 
-    sp = get_subgoal_space(args.env_id, variant_key)
+    sp = get_subgoal_space(args.env_id, variant_key, obs_dim=obs_dim)
     assert sp.obs_dim == obs_dim, f"subgoal space obs_dim {sp.obs_dim} != env obs_dim {obs_dim}"
     latent_subgoal_dim = args.latent_subgoal_dim if variant_key == "latent_object_centric" else 0
 
@@ -208,12 +209,13 @@ def train(args: TrainArgs) -> str:
         num_candidates=args.num_candidates,
         use_off_policy_correction=args.use_off_policy_correction,
         use_phased_reward=args.use_phased_reward, pbrs_alpha=args.pbrs_alpha,
+        low_her_ratio=args.low_her_ratio,
         latent_subgoal_dim=latent_subgoal_dim,
         device=args.device,
     )
     agent = HIROAgent(sp, cfg)
     if args.use_phased_reward:
-        agent.grasp_detector = get_grasp_detector(args.env_id)
+        agent.grasp_detector = get_grasp_detector(args.env_id, obs_dim=obs_dim)
         print(f"phased worker reward (PBRS): detector={'set' if agent.grasp_detector else 'NONE'} "
               f"| subgoal_variant={variant_key} "
               f"| object_dims={sp.object_positions} | pbrs_alpha={args.pbrs_alpha} "
@@ -303,7 +305,17 @@ def train(args: TrainArgs) -> str:
             learning_started = True
             low_metrics, high_metrics = {}, {}
             for _ in range(grad_steps):
-                low_metrics = agent.update_low(low_buf.sample(args.batch_size))
+                low_batch = low_buf.sample(args.batch_size)
+                if args.low_her_ratio > 0.0:
+                    her_mask = torch.rand(args.batch_size, device=device) < args.low_her_ratio
+                    future_next_obs = low_buf.sample_future_next_obs(
+                        low_batch.t_inds.cpu(),
+                        low_batch.e_inds.cpu(),
+                        low_batch.episode_id.cpu(),
+                        low_batch.episode_step.cpu(),
+                    ).to(device)
+                    low_batch = agent.apply_low_her(low_batch, future_next_obs, her_mask)
+                low_metrics = agent.update_low(low_batch)
             if len(high_buf) >= args.batch_size:
                 for _ in range(high_updates):
                     high_metrics = agent.update_high(high_buf.sample(args.batch_size))
@@ -316,6 +328,7 @@ def train(args: TrainArgs) -> str:
                     "data/mean_subgoal_norm": ls.subgoal.norm(dim=-1).mean().item(),
                     "data/low_buffer": len(low_buf),
                     "data/high_buffer": len(high_buf),
+                    "data/low_her_ratio": args.low_her_ratio,
                 }
                 # grasp rate: is the worker actually grasping? (key signal for the phased reward)
                 if agent.grasp_detector is not None:

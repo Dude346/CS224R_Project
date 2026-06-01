@@ -63,6 +63,8 @@ class HierarchicalRollout:
         self.seg_len = torch.zeros(E, dtype=torch.long, device=dev)
         self.seg_obs = torch.zeros(E, c, self.obs_dim, device=dev)
         self.seg_act = torch.zeros(E, c, self.act_dim, device=dev)
+        self.low_episode_id = torch.zeros(E, dtype=torch.long, device=dev)
+        self.low_episode_step = torch.zeros(E, dtype=torch.long, device=dev)
 
     @torch.no_grad()
     def start(self, obs: torch.Tensor) -> torch.Tensor:
@@ -73,6 +75,8 @@ class HierarchicalRollout:
         self.seg_start_obs = obs.clone()
         self.seg_reward.zero_()
         self.seg_len.zero_()
+        self.low_episode_id.zero_()
+        self.low_episode_step.zero_()
         return self.cur_subgoal
 
     @torch.no_grad()
@@ -139,9 +143,16 @@ class HierarchicalRollout:
 
         # 7: store the worker transition with the corrected next subgoal.
         self.low.add(obs, self.cur_subgoal, action, r_lo, real_next_obs,
-                     worker_next_subgoal, bootstrap_done)
+                     worker_next_subgoal, bootstrap_done,
+                     episode_id=self.low_episode_id,
+                     episode_step=self.low_episode_step)
 
         # 8: commit segment-state resets for flushed envs and advance cur_subgoal.
+        self.low_episode_step = self.low_episode_step + 1
+        end_idx = episode_end.nonzero(as_tuple=True)[0]
+        if end_idx.numel() > 0:
+            self.low_episode_id[end_idx] = self.low_episode_id[end_idx] + 1
+            self.low_episode_step[end_idx] = 0
         if idx.numel() > 0:
             self.seg_subgoal[idx] = new_g
             self.seg_start_obs[idx] = resample_obs[idx]

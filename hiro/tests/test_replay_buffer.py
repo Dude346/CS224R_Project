@@ -115,6 +115,46 @@ class TestLowLevelBuffer:
         assert s.done.dtype == torch.float32
         assert torch.all(s.done == 1.0)
 
+    def test_sample_returns_buffer_indices_and_episode_metadata(self):
+        E = 2
+        b = LowLevelBuffer(40, num_envs=E, obs_dim=OBS, subgoal_dim=SG, action_dim=ACT)
+        obs, sg, act, rew, nobs, nsg, done = _ll_step(E, 1.0)
+        episode_id = torch.tensor([3, 7], dtype=torch.long)
+        episode_step = torch.tensor([4, 9], dtype=torch.long)
+        b.add(obs, sg, act, rew, nobs, nsg, done, episode_id=episode_id, episode_step=episode_step)
+        s = b.sample(16)
+        assert s.t_inds is not None and s.e_inds is not None
+        assert s.episode_id is not None and s.episode_step is not None
+        assert s.t_inds.shape == (16,)
+        assert s.e_inds.shape == (16,)
+        assert torch.all((s.episode_id == 3) | (s.episode_id == 7))
+        assert torch.all((s.episode_step == 4) | (s.episode_step == 9))
+
+    def test_sample_future_next_obs_stays_within_same_episode(self):
+        E = 1
+        b = LowLevelBuffer(100, num_envs=E, obs_dim=OBS, subgoal_dim=SG, action_dim=ACT)
+        # Episode 0: three steps with distinctive next_obs tags 101, 102, 103
+        for step, tag in enumerate((100.0, 101.0, 102.0)):
+            obs, sg, act, rew, nobs, nsg, done = _ll_step(E, tag)
+            nobs[:, 0] = tag + 1.0
+            b.add(obs, sg, act, rew, nobs, nsg, done,
+                  episode_id=torch.tensor([0]), episode_step=torch.tensor([step]))
+        # Episode 1: two steps with very different tags 201, 202
+        for step, tag in enumerate((200.0, 201.0)):
+            obs, sg, act, rew, nobs, nsg, done = _ll_step(E, tag)
+            nobs[:, 0] = tag + 1.0
+            b.add(obs, sg, act, rew, nobs, nsg, done,
+                  episode_id=torch.tensor([1]), episode_step=torch.tensor([step]))
+        future = b.sample_future_next_obs(
+            t_inds=torch.tensor([0]),
+            e_inds=torch.tensor([0]),
+            episode_id=torch.tensor([0]),
+            episode_step=torch.tensor([1]),
+        )
+        assert future.shape == (1, OBS)
+        # Must come from episode 0, step >= 1 => next_obs tag in {102, 103}
+        assert future[0, 0].item() in {102.0, 103.0}
+
 
 # ---------------------------------------------------------------------------
 # HighLevelBuffer

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -67,6 +68,7 @@ class HIROConfig:
     latent_pretrain_range: float = 2.0  # sample geometric subgoals over +/- range*scale (telescoped
                                         # residuals routinely exceed the manager's one-step bound)
     latent_lr: float = 1e-3
+    low_her_ratio: float = 0.8          # fraction of worker batch relabeled with future achieved goals
     hidden_dim: int = 256
     n_hidden: int = 3
     device: str = "cpu"
@@ -249,10 +251,9 @@ class HIROAgent:
         is_grasped_s_next = self.grasp_detector(s_next)
         # PickCube object-centric gets the farming-proof task-potential reward:
         # telescoping potential shaping that mirrors the env's own reach/grasp/
-        # place reward, so the worker is actually rewarded for lifting the cube
-        # to the (aerial) goal rather than parking on it. Coefficients mirror
-        # PickCube's dense-reward weights (reach∈[0,1], grasp=1, place∈[0,1]).
-        if self.sp.obs_dim == 42 and self.sp.indices == [36, 37, 38, 39, 40, 41]:
+        # place reward. Match semantically, not by Panda-specific obs indices,
+        # so the same path works for other robots whose agent-state prefix is larger.
+        if self.sp.reward_mode == "pickcube_task_potential":
             return self.sp.task_potential_intrinsic_reward(
                 s, g_base, s_next, is_grasped_s, is_grasped_s_next,
                 reach_coef=1.0, grasp_coef=1.0, place_coef=1.0,
@@ -419,6 +420,55 @@ class HIROAgent:
             gamma=self.cfg.gamma_low,
             state=state, action=batch.action, reward=batch.reward,
             next_state=next_state, done=batch.done,
+        )
+
+    @torch.no_grad()
+    def apply_low_her(
+        self,
+        batch: LowLevelSample,
+        future_next_obs: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> LowLevelSample:
+        """Relabel a worker batch with future achieved goals from the same episode.
+
+        Hindsight goal in geometric subgoal space:
+            g_her = project(s_future) - project(s)
+        i.e. make the subgoal target equal to a state that was actually achieved
+        later in the same episode. The relabeled next_subgoal and worker reward
+        are then recomputed under the current worker reward definition.
+        """
+        if mask is None:
+            mask = torch.ones(batch.obs.shape[0], dtype=torch.bool, device=batch.obs.device)
+        if mask.ndim != 1 or mask.shape[0] != batch.obs.shape[0]:
+            raise ValueError("mask must be shape (B,)")
+        if not mask.any():
+            return batch
+
+        obs = batch.obs
+        achieved = future_next_obs.to(obs.device)
+        g_base = self.sp.project(achieved) - self.sp.project(obs)
+        g_interface = self.encode_subgoal(g_base)
+
+        subgoal = batch.subgoal.clone()
+        next_subgoal = batch.next_subgoal.clone()
+        reward = batch.reward.clone()
+
+        subgoal[mask] = g_interface[mask]
+        next_subgoal[mask] = self.subgoal_transition(obs[mask], g_interface[mask], batch.next_obs[mask])
+        reward[mask] = self.worker_reward(obs[mask], g_interface[mask], batch.next_obs[mask])
+
+        return LowLevelSample(
+            obs=batch.obs,
+            subgoal=subgoal,
+            action=batch.action,
+            reward=reward,
+            next_obs=batch.next_obs,
+            next_subgoal=next_subgoal,
+            done=batch.done,
+            t_inds=batch.t_inds,
+            e_inds=batch.e_inds,
+            episode_id=batch.episode_id,
+            episode_step=batch.episode_step,
         )
 
     def update_high(self, batch: HighLevelSample) -> dict:

@@ -26,6 +26,7 @@ from hiro.subgoal_space import (
     ObsBitGraspReader,
     PositionalGraspDetector,
     SubgoalSpace,
+    get_grasp_detector,
     get_subgoal_space,
     normalize_subgoal_variant,
 )
@@ -118,6 +119,20 @@ class TestConstruction:
         assert sp.indices == [36, 37, 38, 39, 40, 41]
         assert sp.label == "tcp_to_obj+obj_to_goal"
         assert sp.object_positions == [3, 4, 5]
+        assert sp.reward_mode == "pickcube_task_potential"
+
+    def test_dynamic_pickcube_object_centric_space(self):
+        sp = get_subgoal_space("PickCube-v1", "object_centric", obs_dim=44)
+        assert sp.indices == [38, 39, 40, 41, 42, 43]
+        assert sp.object_positions == [3, 4, 5]
+        assert sp.reward_mode == "pickcube_task_potential"
+        assert sp.qvel_slice == (10, 20)
+
+    def test_dynamic_stackcube_object_centric_space(self):
+        sp = get_subgoal_space("StackCube-v1", "object_centric", obs_dim=54)
+        assert sp.indices == [45, 46, 47, 51, 52, 53]
+        assert sp.object_positions == [3, 4, 5]
+        assert sp.qvel_slice == (12, 24)
 
     def test_normalize_subgoal_variant_aliases(self):
         assert normalize_subgoal_variant("default") == "hybrid"
@@ -553,7 +568,7 @@ class TestTaskPotentialReward:
         assert torch.all(torch.isfinite(r))
 
     def test_tiny_post_grasp_corrections_still_pay_smoothly(self):
-        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3))
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3), qvel_slice=(9, 18))
         s = torch.zeros(18)
         sn = torch.zeros(18)
         s[2] = 0.014
@@ -564,7 +579,7 @@ class TestTaskPotentialReward:
         assert r.item() > 0.0
 
     def test_near_goal_slowing_down_is_rewarded(self):
-        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3))
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3), qvel_slice=(9, 18))
         s = torch.zeros(18)
         sn = torch.zeros(18)
         s[2] = 0.010
@@ -576,7 +591,7 @@ class TestTaskPotentialReward:
         assert r.item() > 0.0
 
     def test_near_goal_low_qvel_beats_high_qvel(self):
-        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3))
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3), qvel_slice=(9, 18))
         s = torch.zeros(18)
         s[2] = 0.010
         sn_fast = s.clone()
@@ -611,6 +626,21 @@ class TestGraspReaders:
         assert bool(g[0]) is True
         assert bool(g[1]) is False
         assert bool(g[2]) is False
+
+    def test_dynamic_pickcube_detector_tracks_shifted_grasp_bit(self):
+        det = get_grasp_detector("PickCube-v1", obs_dim=44)
+        obs = torch.zeros(2, 44)
+        obs[0, 20] = 1.0
+        obs[1, 20] = 0.0
+        g = det(obs)
+        assert torch.equal(g, torch.tensor([True, False]))
+
+    def test_dynamic_stackcube_detector_tracks_shifted_pose_fields(self):
+        det = get_grasp_detector("StackCube-v1", obs_dim=54)
+        obs = torch.zeros(1, 54)
+        obs[0, 45:48] = torch.tensor([0.0, 0.0, 0.0])
+        obs[0, 33] = 0.10
+        assert bool(det(obs)[0]) is True
 
     def test_stackcube_detector_is_force_free(self):
         # StackCube still uses the positional heuristic, so identical obs ->

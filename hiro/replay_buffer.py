@@ -36,6 +36,7 @@ end early have length < c; the padded tail must be masked using `inter_len`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -53,6 +54,10 @@ class LowLevelSample:
     next_obs: torch.Tensor      # (B, obs_dim)
     next_subgoal: torch.Tensor  # (B, subgoal_dim)
     done: torch.Tensor          # (B,)
+    t_inds: Optional[torch.Tensor] = None      # (B,) time indices in buffer
+    e_inds: Optional[torch.Tensor] = None      # (B,) env indices in buffer
+    episode_id: Optional[torch.Tensor] = None  # (B,) per-env episode id for HER
+    episode_step: Optional[torch.Tensor] = None  # (B,) step index within episode
 
 
 @dataclass
@@ -108,6 +113,8 @@ class LowLevelBuffer:
         self.next_obs = torch.zeros((E, S, obs_dim), device=dev)
         self.next_subgoal = torch.zeros((E, S, subgoal_dim), device=dev)
         self.done = torch.zeros((E, S), device=dev)
+        self.episode_id = torch.zeros((E, S), dtype=torch.long, device=dev)
+        self.episode_step = torch.zeros((E, S), dtype=torch.long, device=dev)
 
     def __len__(self) -> int:
         return (self.per_env_capacity if self.full else self.pos) * self.num_envs
@@ -121,6 +128,8 @@ class LowLevelBuffer:
         next_obs: torch.Tensor,
         next_subgoal: torch.Tensor,
         done: torch.Tensor,
+        episode_id: Optional[torch.Tensor] = None,
+        episode_step: Optional[torch.Tensor] = None,
     ) -> None:
         """Append one transition for every env. Leading dim of each arg = num_envs."""
         dev = self.storage_device
@@ -132,6 +141,10 @@ class LowLevelBuffer:
         self.next_obs[i] = next_obs.to(dev)
         self.next_subgoal[i] = next_subgoal.to(dev)
         self.done[i] = done.to(dev).float()
+        if episode_id is not None:
+            self.episode_id[i] = episode_id.to(dev).long()
+        if episode_step is not None:
+            self.episode_step[i] = episode_step.to(dev).long()
 
         self.pos += 1
         if self.pos == self.per_env_capacity:
@@ -153,7 +166,42 @@ class LowLevelBuffer:
             next_obs=self.next_obs[t_inds, e_inds].to(dev),
             next_subgoal=self.next_subgoal[t_inds, e_inds].to(dev),
             done=self.done[t_inds, e_inds].to(dev),
+            t_inds=t_inds.to(dev),
+            e_inds=e_inds.to(dev),
+            episode_id=self.episode_id[t_inds, e_inds].to(dev),
+            episode_step=self.episode_step[t_inds, e_inds].to(dev),
         )
+
+    def sample_future_next_obs(
+        self,
+        t_inds: torch.Tensor,
+        e_inds: torch.Tensor,
+        episode_id: torch.Tensor,
+        episode_step: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample a future achieved state (as next_obs) from the same episode.
+
+        This is intentionally still "dumb storage": given storage indices and
+        per-transition episode metadata, it returns a uniformly sampled future
+        next_obs from the same env/episode with episode_step >= current step.
+        """
+        high = self.per_env_capacity if self.full else self.pos
+        if high == 0:
+            raise RuntimeError("cannot sample future obs from an empty buffer")
+        out = torch.empty((t_inds.shape[0], self.next_obs.shape[-1]), device=self.sample_device)
+        for i in range(t_inds.shape[0]):
+            env = int(e_inds[i].item())
+            ep = int(episode_id[i].item())
+            step = int(episode_step[i].item())
+            valid = (self.episode_id[:high, env] == ep) & (self.episode_step[:high, env] >= step)
+            candidates = valid.nonzero(as_tuple=False).flatten()
+            if candidates.numel() == 0:
+                chosen = int(t_inds[i].item())
+            else:
+                pick = torch.randint(0, candidates.numel(), size=(1,))
+                chosen = int(candidates[pick].item())
+            out[i] = self.next_obs[chosen, env].to(self.sample_device)
+        return out
 
 
 # ---------------------------------------------------------------------------

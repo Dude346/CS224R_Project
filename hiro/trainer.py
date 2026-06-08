@@ -30,12 +30,20 @@ from hiro.hiro_agent import HIROAgent, HIROConfig
 from hiro.replay_buffer import HighLevelBuffer, LowLevelBuffer
 from hiro.rollout import HierarchicalRollout
 from hiro.oracle import make_oracle
-from hiro.subgoal_space import get_grasp_detector, get_manager_input_dims, get_place_residual_dims, get_reach_dims, get_subgoal_space
+from hiro.subgoal_space import (
+    get_grasp_detector,
+    get_manager_input_dims,
+    get_place_residual_dims,
+    get_reach_dims,
+    get_subgoal_space,
+    normalize_subgoal_variant,
+)
 
 
 @dataclass
 class TrainArgs:
     env_id: str = "PickCube-v1"
+    subgoal_variant: str = "hybrid"
     robot_uids: str = "panda"
     control_mode: str = "pd_joint_delta_pos"
     seed: int = 1
@@ -98,10 +106,17 @@ class TrainArgs:
     # across robots with different obs sizes (panda<->fetch). Enables the Option-B
     # learned-manager cross-embodiment transfer.
     manager_input_mode: str = "full"
+    # Latent subgoal codec (used ONLY by the latent_object_centric variant; the
+    # trainer forces it to 0 for every other variant, so this default is safe for
+    # the default path).
+    latent_subgoal_dim: int = 6
+    # Hindsight (HER) relabeling of worker subgoals. 0.0 = off (default path); the
+    # latent / object-centric runs enable it with --low-her-ratio 0.8.
+    low_her_ratio: float = 0.0
     # partial_reset=True: episodes end on TRUE termination (env success), not just
     # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
     # success). Flat SAC baselines used False to match upstream.
-    partial_reset: bool = True
+    partial_reset: bool = False
     policy_lr: float = 3e-4
     q_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -129,7 +144,7 @@ def build_envs(args: TrainArgs, run_name: str):
     from mani_skill.utils.wrappers.record import RecordEpisode
     from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
-    if args.robot_uids != "panda":
+    if "panda" in args.robot_uids and not args.robot_uids.startswith("panda"):
         import weak_panda  # noqa: F401 — registers custom robots on import
 
     env_kwargs = dict(
@@ -264,9 +279,10 @@ def train(args: TrainArgs) -> str:
     torch.manual_seed(args.seed)
 
     device = torch.device(args.device)
+    variant_key = normalize_subgoal_variant(args.subgoal_variant)
     run_name = args.exp_name or (
-        f"hiro_{args.env_id.replace('-', '_')}_{args.robot_uids}_"
-        f"{args.control_mode}_c{args.c}_seed{args.seed}_{args.total_timesteps}steps"
+        f"hiro_{args.env_id.replace('-', '_')}_{variant_key}_"
+        f"{args.robot_uids}_{args.control_mode}_c{args.c}_seed{args.seed}_{args.total_timesteps}steps"
     )
     run_dir = f"{args.output_root}/{run_name}"
     os.makedirs(run_dir, exist_ok=True)
@@ -277,10 +293,17 @@ def train(args: TrainArgs) -> str:
     low = np.asarray(envs.single_action_space.low).reshape(-1)
     high = np.asarray(envs.single_action_space.high).reshape(-1)
 
-    sp = get_subgoal_space(args.env_id, args.subgoal_mode, args.robot_uids)
+    # Two subgoal-space selection schemes coexist: the object/latent variants are
+    # built from the obs layout (variant_key), while the geometric modes (hiro /
+    # cube_centric) are routed per robot (panda / fetch).
+    if variant_key in ("object_centric", "latent_object_centric"):
+        sp = get_subgoal_space(args.env_id, variant_key, obs_dim=obs_dim)
+    else:
+        sp = get_subgoal_space(args.env_id, args.subgoal_mode, args.robot_uids)
     assert sp.obs_dim == obs_dim, f"subgoal space obs_dim {sp.obs_dim} != env obs_dim {obs_dim}"
     if args.subgoal_mode != "hiro":
         print(f"SUBGOAL MODE = {args.subgoal_mode}: {sp!r} indices={sp.indices} object_dims={sp.object_dims}")
+    latent_subgoal_dim = args.latent_subgoal_dim if variant_key == "latent_object_centric" else 0
 
     # Body-independent manager input (Option-B cross-robot transfer). "object" =>
     # manager reads only [tcp,cube,goal] (9-D); "full" (default) => full obs.
@@ -311,6 +334,8 @@ def train(args: TrainArgs) -> str:
         reach_dims=tuple(get_reach_dims(args.env_id, args.robot_uids) or ())
             if args.reach_pbrs_weight > 0.0 else (),
         manager_input_dims=mgr_dims,
+        low_her_ratio=args.low_her_ratio,
+        latent_subgoal_dim=latent_subgoal_dim,
         device=args.device,
     )
     agent = HIROAgent(sp, cfg)
@@ -327,6 +352,7 @@ def train(args: TrainArgs) -> str:
     if args.use_phased_reward:
         agent.grasp_detector = get_grasp_detector(args.env_id, args.robot_uids)
         print(f"phased worker reward (PBRS): detector={'set' if agent.grasp_detector else 'NONE'} "
+              f"| subgoal_variant={variant_key} "
               f"| object_dims={sp.object_positions} | pbrs_alpha={args.pbrs_alpha} "
               f"| gamma_low={args.gamma_low}")
     if args.worker_extrinsic_weight > 0.0:
@@ -373,9 +399,9 @@ def train(args: TrainArgs) -> str:
         print("FREEZE MANAGER on -- manager acts but is NOT trained (update_high skipped). "
               "Transfer setup: reuse manager, adapt only the worker.")
 
-    low_buf = LowLevelBuffer(args.low_buffer_size, args.num_envs, obs_dim, sp.dim, act_dim,
+    low_buf = LowLevelBuffer(args.low_buffer_size, args.num_envs, obs_dim, agent.subgoal_dim, act_dim,
                              storage_device=args.buffer_device, sample_device=args.device)
-    high_buf = HighLevelBuffer(args.high_buffer_size, obs_dim, sp.dim, act_dim, args.c,
+    high_buf = HighLevelBuffer(args.high_buffer_size, obs_dim, agent.subgoal_dim, act_dim, args.c,
                                storage_device=args.buffer_device, sample_device=args.device)
     rollout = HierarchicalRollout(agent, low_buf, high_buf, args.num_envs, device=args.device)
 
@@ -478,40 +504,58 @@ def train(args: TrainArgs) -> str:
             learning_started = True
             low_metrics, high_metrics = {}, {}
             for _ in range(grad_steps):
-                low_metrics = agent.update_low(low_buf.sample(args.batch_size))
+                low_batch = low_buf.sample(args.batch_size)
+                if args.low_her_ratio > 0.0:
+                    her_mask = torch.rand(args.batch_size, device=device) < args.low_her_ratio
+                    future_next_obs = low_buf.sample_future_next_obs(
+                        low_batch.t_inds.cpu(),
+                        low_batch.e_inds.cpu(),
+                        low_batch.episode_id.cpu(),
+                        low_batch.episode_step.cpu(),
+                    ).to(device)
+                    low_batch = agent.apply_low_her(low_batch, future_next_obs, her_mask)
+                low_metrics = agent.update_low(low_batch)
             if (not args.oracle_manager) and (not args.flat_worker) and (not args.freeze_manager) and len(high_buf) >= args.batch_size:
                 for _ in range(high_updates):
                     high_metrics = agent.update_high(high_buf.sample(args.batch_size))
 
             if global_step % 1000 < args.training_freq:
+                # data diagnostics
+                ls = low_buf.sample(min(args.batch_size, len(low_buf)))
+                data_log = {
+                    "data/mean_intrinsic_reward": ls.reward.mean().item(),
+                    "data/mean_subgoal_norm": ls.subgoal.norm(dim=-1).mean().item(),
+                    "data/low_buffer": len(low_buf),
+                    "data/high_buffer": len(high_buf),
+                    "data/low_her_ratio": args.low_her_ratio,
+                }
+                # grasp rate: is the worker actually grasping? (key signal for the phased reward)
+                if agent.grasp_detector is not None:
+                    data_log["data/grasp_rate"] = agent.grasp_detector(ls.next_obs).float().mean().item()
+                if len(high_buf) > 0:
+                    hs = high_buf.sample(min(args.batch_size, len(high_buf)))
+                    data_log["data/mean_manager_reward"] = hs.reward_sum.mean().item()
+
                 for k, v in low_metrics.items():
                     writer.add_scalar(f"low/{k}", v, global_step)
                 for k, v in high_metrics.items():
                     writer.add_scalar(f"high/{k}", v, global_step)
-                # data diagnostics
-                ls = low_buf.sample(min(args.batch_size, len(low_buf)))
-                writer.add_scalar("data/mean_intrinsic_reward", ls.reward.mean().item(), global_step)
-                writer.add_scalar("data/mean_subgoal_norm", ls.subgoal.norm(dim=-1).mean().item(), global_step)
-                writer.add_scalar("data/low_buffer", len(low_buf), global_step)
-                writer.add_scalar("data/high_buffer", len(high_buf), global_step)
-                # grasp rate: is the worker actually grasping? (key signal for the phased reward)
-                if agent.grasp_detector is not None:
-                    grasp_rate = agent.grasp_detector(ls.next_obs).float().mean().item()
-                    writer.add_scalar("data/grasp_rate", grasp_rate, global_step)
-                    # Exp 1: once grasping is bootstrapped, begin annealing w->0.
-                    if args.anneal_w and not anneal_started and grasp_rate > args.anneal_w_grasp_threshold:
-                        anneal_started = True
-                        anneal_start_step = global_step
-                        print(f"[anneal_w] grasp_rate {grasp_rate:.2f} > {args.anneal_w_grasp_threshold} "
-                              f"at step {global_step}: annealing w {w_start}->0 over remaining budget")
-                writer.add_scalar("data/worker_w", agent.cfg.worker_extrinsic_weight, global_step)
-                if len(high_buf) > 0:
-                    hs = high_buf.sample(min(args.batch_size, len(high_buf)))
-                    writer.add_scalar("data/mean_manager_reward", hs.reward_sum.mean().item(), global_step)
+                # Exp 1 (anneal_w): once grasping bootstraps, begin annealing w->0.
+                grasp_rate = data_log.get("data/grasp_rate")
+                if (args.anneal_w and not anneal_started and grasp_rate is not None
+                        and grasp_rate > args.anneal_w_grasp_threshold):
+                    anneal_started = True
+                    anneal_start_step = global_step
+                    print(f"[anneal_w] grasp_rate {grasp_rate:.2f} > {args.anneal_w_grasp_threshold} "
+                          f"at step {global_step}: annealing w {w_start}->0 over remaining budget")
+                data_log["data/worker_w"] = agent.cfg.worker_extrinsic_weight
+                for k, v in data_log.items():
+                    writer.add_scalar(k, v, global_step)
                 if args.track:
                     import wandb
                     wandb.log({**{f"low/{k}": v for k, v in low_metrics.items()},
-                               **{f"high/{k}": v for k, v in high_metrics.items()}}, step=global_step)
+                               **{f"high/{k}": v for k, v in high_metrics.items()},
+                               **data_log}, step=global_step)
 
         # ---- eval ----
         if global_step - last_eval >= args.eval_freq:

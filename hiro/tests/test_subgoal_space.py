@@ -21,11 +21,15 @@ import torch
 from hiro.subgoal_space import (
     CUBE_CENTRIC_SUBGOAL_SPACES,
     GRASP_DETECTORS,
+    HYBRID_SUBGOAL_SPACES,
     HIRO_SUBGOAL_SPACES,
+    OBJECT_CENTRIC_SUBGOAL_SPACES,
     ObsBitGraspReader,
     PositionalGraspDetector,
     SubgoalSpace,
+    get_grasp_detector,
     get_subgoal_space,
+    normalize_subgoal_variant,
 )
 
 # ---------------------------------------------------------------------------
@@ -71,9 +75,78 @@ class TestConstruction:
         # reward (the same pathology that blocked the early HIRO runs).
         assert HIRO_SUBGOAL_SPACES["StackCube-v1"].dim == 6
 
+    def test_object_centric_pickcube_dim(self):
+        assert OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"].dim == 6
+
+    def test_object_centric_stackcube_dim(self):
+        assert OBJECT_CENTRIC_SUBGOAL_SPACES["StackCube-v1"].dim == 6
+
+    def test_hybrid_pickcube_dim(self):
+        assert HYBRID_SUBGOAL_SPACES["PickCube-v1"].dim == 9
+
+    def test_hybrid_stackcube_dim(self):
+        assert HYBRID_SUBGOAL_SPACES["StackCube-v1"].dim == 9
+
     def test_get_subgoal_space_unknown_raises(self):
         with pytest.raises(ValueError):
             get_subgoal_space("UnknownEnv-v1")
+
+    def test_get_object_centric_pickcube_space(self):
+        sp = get_subgoal_space("PickCube-v1", "object_centric")
+        assert sp.indices == [36, 37, 38, 39, 40, 41]
+        assert sp.label == "tcp_to_obj+obj_to_goal"
+        assert sp.object_positions == [3, 4, 5]
+
+    def test_get_object_centric_stackcube_space(self):
+        sp = get_subgoal_space("StackCube-v1", "object-centric")
+        assert sp.indices == [39, 40, 41, 45, 46, 47]
+        assert sp.label == "tcp_to_cubeA+cubeA_to_cubeB"
+        assert sp.object_positions == [3, 4, 5]
+
+    def test_get_hybrid_pickcube_space(self):
+        sp = get_subgoal_space("PickCube-v1", "hybrid")
+        assert sp.indices == [19, 20, 21, 36, 37, 38, 39, 40, 41]
+        assert sp.label == "tcp_xyz+tcp_to_obj+obj_to_goal"
+        assert sp.object_positions == [6, 7, 8]
+
+    def test_get_hybrid_stackcube_space(self):
+        sp = get_subgoal_space("StackCube-v1", "hybrid")
+        assert sp.indices == [18, 19, 20, 39, 40, 41, 45, 46, 47]
+        assert sp.label == "tcp_xyz+tcp_to_cubeA+cubeA_to_cubeB"
+        assert sp.object_positions == [6, 7, 8]
+
+    def test_get_latent_object_centric_pickcube_space(self):
+        sp = get_subgoal_space("PickCube-v1", "latent_object_centric")
+        assert sp.indices == [36, 37, 38, 39, 40, 41]
+        assert sp.label == "tcp_to_obj+obj_to_goal"
+        assert sp.object_positions == [3, 4, 5]
+        assert sp.reward_mode == "pickcube_task_potential"
+
+    def test_dynamic_pickcube_object_centric_space(self):
+        sp = get_subgoal_space("PickCube-v1", "object_centric", obs_dim=44)
+        assert sp.indices == [38, 39, 40, 41, 42, 43]
+        assert sp.object_positions == [3, 4, 5]
+        assert sp.reward_mode == "pickcube_task_potential"
+        assert sp.qvel_slice == (10, 20)
+
+    def test_dynamic_stackcube_object_centric_space(self):
+        sp = get_subgoal_space("StackCube-v1", "object_centric", obs_dim=54)
+        assert sp.indices == [45, 46, 47, 51, 52, 53]
+        assert sp.object_positions == [3, 4, 5]
+        assert sp.qvel_slice == (12, 24)
+
+    def test_normalize_subgoal_variant_aliases(self):
+        assert normalize_subgoal_variant("default") == "hybrid"
+        assert normalize_subgoal_variant("absolute") == "absolute"
+        assert normalize_subgoal_variant("hiro") == "hybrid"
+        assert normalize_subgoal_variant("object-centric") == "object_centric"
+        assert normalize_subgoal_variant("obj") == "object_centric"
+        assert normalize_subgoal_variant("latent-object-centric") == "latent_object_centric"
+        assert normalize_subgoal_variant("stitch") == "latent_object_centric"
+
+    def test_normalize_subgoal_variant_unknown_raises(self):
+        with pytest.raises(ValueError):
+            normalize_subgoal_variant("weird")
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +474,139 @@ class TestPBRSReward:
         assert torch.allclose(r, expected)
 
 
+class TestTaskPotentialReward:
+    """The farming-proof worker reward that replaced the dense_reach version.
+
+    Layout matches object-centric PickCube: projected subgoal = [hand dims
+    (tcp_to_obj), object dims (obj_to_goal)]. Defaults reach=grasp=place=1,
+    tanh_temp=5. Every term is a telescoping potential difference, so the key
+    invariants are: holding static pays 0 (no hold tax / no farming), progress
+    up the task potential pays positive, and giving up potential (e.g. dropping)
+    pays negative.
+    """
+
+    @pytest.fixture
+    def psp(self) -> SubgoalSpace:
+        # dims 0,1 = tcp_to_obj (hand); dims 2,3 = obj_to_goal (object)
+        return SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=4, object_dims=(2, 3))
+
+    def _r(self, psp, s, g, sn, gs, gsn, **kwargs):
+        return psp.task_potential_intrinsic_reward(
+            s, g, sn, torch.tensor(gs), torch.tensor(gsn), **kwargs
+        ).item()
+
+    def test_lifting_beats_holding_post_grasp(self, psp):
+        """THE property the old reward violated: once grasped, moving the cube
+        toward the goal must earn strictly more than holding it static."""
+        # gripper on cube (tcp_to_obj = 0); cube starts 0.2 from goal.
+        s = torch.tensor([0.0, 0.0, 0.20, 0.0])
+        g = torch.zeros(4)
+        sn_hold = s.clone()                              # cube unmoved
+        sn_lift = torch.tensor([0.0, 0.0, 0.10, 0.0])    # cube halved its goal distance
+        r_hold = self._r(psp, s, g, sn_hold, 1.0, 1.0)
+        r_lift = self._r(psp, s, g, sn_lift, 1.0, 1.0)
+        assert r_lift > r_hold
+        assert r_hold == pytest.approx(0.0, abs=1e-6)    # no hold tax
+
+    def test_post_grasp_object_progress_can_be_upweighted(self, psp):
+        s = torch.tensor([0.0, 0.0, 0.20, 0.0])
+        g = torch.tensor([0.0, 0.0, -0.20, 0.0])
+        sn = torch.tensor([0.0, 0.0, 0.10, 0.0])
+        r_base = self._r(psp, s, g, sn, 1.0, 1.0, object_progress_coef=1.0)
+        r_up = self._r(psp, s, g, sn, 1.0, 1.0, object_progress_coef=2.0)
+        assert r_up > r_base
+
+    def test_static_hold_pays_zero(self, psp):
+        """No state change + zero subgoal residual delta => exactly 0 (cannot be
+        farmed by sitting still in any phase)."""
+        s = torch.tensor([0.05, 0.0, 0.15, 0.0])
+        for gs in (0.0, 1.0):
+            r = self._r(psp, s, torch.zeros(4), s.clone(), gs, gs)
+            assert r == pytest.approx(0.0, abs=1e-6)
+
+    def test_hover_near_cube_without_grasp_is_not_farmable(self, psp):
+        """Parking the gripper on the cube without grasping pays ~0 (the old
+        dense_reach paid ~+1/step here)."""
+        s = torch.zeros(4)                  # tcp_to_obj = 0, not grasped
+        r = self._r(psp, s, torch.zeros(4), s.clone(), 0.0, 0.0)
+        assert r == pytest.approx(0.0, abs=1e-6)
+
+    def test_reaching_toward_cube_is_rewarded_pregrasp(self, psp):
+        s = torch.tensor([0.20, 0.0, 0.0, 0.0])
+        sn = torch.tensor([0.10, 0.0, 0.0, 0.0])         # hand closer to cube
+        r = self._r(psp, s, torch.zeros(4), sn, 0.0, 0.0)
+        assert r > 0.0
+
+    def test_grasp_acquisition_is_rewarded(self, psp):
+        s = torch.tensor([0.0, 0.0, 0.30, 0.0])          # at cube, far from goal
+        sn = s.clone()
+        r = self._r(psp, s, torch.zeros(4), sn, 0.0, 1.0)  # grasp flips on
+        assert r > 0.0
+
+    def test_dropping_is_penalized(self, psp):
+        s = torch.zeros(4)                               # grasped, cube at goal
+        sn = s.clone()
+        r = self._r(psp, s, torch.zeros(4), sn, 1.0, 0.0)  # grasp lost
+        assert r < 0.0
+
+    def test_empty_object_dims_has_no_place_term(self):
+        """With no object dims the place potential vanishes; reaching still works."""
+        sp = SubgoalSpace(indices=[0, 1], obs_dim=2)     # hand-only
+        s = torch.tensor([0.20, 0.0])
+        sn = torch.tensor([0.10, 0.0])
+        r = sp.task_potential_intrinsic_reward(
+            s, torch.zeros(2), sn, torch.tensor(0.0), torch.tensor(0.0)
+        )
+        assert r.item() > 0.0
+
+    def test_batched_shape(self, psp):
+        s = torch.rand(7, 4) * 0.2
+        g = torch.zeros(7, 4)
+        sn = torch.rand(7, 4) * 0.2
+        gs = (torch.rand(7) > 0.5).float()
+        r = psp.task_potential_intrinsic_reward(s, g, sn, gs, gs)
+        assert r.shape == (7,)
+        assert torch.all(torch.isfinite(r))
+
+    def test_tiny_post_grasp_corrections_still_pay_smoothly(self):
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3), qvel_slice=(9, 18))
+        s = torch.zeros(18)
+        sn = torch.zeros(18)
+        s[2] = 0.014
+        sn[2] = 0.010
+        r = sp.task_potential_intrinsic_reward(
+            s, torch.zeros(4), sn, torch.tensor(1.0), torch.tensor(1.0)
+        )
+        assert r.item() > 0.0
+
+    def test_near_goal_slowing_down_is_rewarded(self):
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3), qvel_slice=(9, 18))
+        s = torch.zeros(18)
+        sn = torch.zeros(18)
+        s[2] = 0.010
+        sn[2] = 0.010
+        s[9:18] = 1.0
+        r = sp.task_potential_intrinsic_reward(
+            s, torch.zeros(4), sn, torch.tensor(1.0), torch.tensor(1.0)
+        )
+        assert r.item() > 0.0
+
+    def test_near_goal_low_qvel_beats_high_qvel(self):
+        sp = SubgoalSpace(indices=[0, 1, 2, 3], obs_dim=18, object_dims=(2, 3), qvel_slice=(9, 18))
+        s = torch.zeros(18)
+        s[2] = 0.010
+        sn_fast = s.clone()
+        sn_slow = s.clone()
+        sn_fast[9:18] = 1.0
+        r_fast = sp.task_potential_intrinsic_reward(
+            s, torch.zeros(4), sn_fast, torch.tensor(1.0), torch.tensor(1.0)
+        )
+        r_slow = sp.task_potential_intrinsic_reward(
+            s, torch.zeros(4), sn_slow, torch.tensor(1.0), torch.tensor(1.0)
+        )
+        assert r_slow.item() > r_fast.item()
+
+
 # ---------------------------------------------------------------------------
 # Grasp-state readers
 # ---------------------------------------------------------------------------
@@ -421,6 +627,21 @@ class TestGraspReaders:
         assert bool(g[0]) is True
         assert bool(g[1]) is False
         assert bool(g[2]) is False
+
+    def test_dynamic_pickcube_detector_tracks_shifted_grasp_bit(self):
+        det = get_grasp_detector("PickCube-v1", obs_dim=44)
+        obs = torch.zeros(2, 44)
+        obs[0, 20] = 1.0
+        obs[1, 20] = 0.0
+        g = det(obs)
+        assert torch.equal(g, torch.tensor([True, False]))
+
+    def test_dynamic_stackcube_detector_tracks_shifted_pose_fields(self):
+        det = get_grasp_detector("StackCube-v1", obs_dim=54)
+        obs = torch.zeros(1, 54)
+        obs[0, 45:48] = torch.tensor([0.0, 0.0, 0.0])
+        obs[0, 33] = 0.10
+        assert bool(det(obs)[0]) is True
 
     def test_stackcube_detector_is_force_free(self):
         # StackCube still uses the positional heuristic, so identical obs ->

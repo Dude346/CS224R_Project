@@ -195,6 +195,32 @@ class TestStorageCorrectness:
         assert torch.allclose(low.next_obs[0, 0], terminal[0])
         assert torch.allclose(roll.seg_start_obs[0], resample[0])  # next segment from resample
 
+    def test_low_episode_metadata_increments_across_episode_end(self):
+        E, c = 1, 5
+        agent, low, high, roll, sp = setup(E, c)
+        roll.start(torch.randn(E, OBS))
+
+        obs = torch.randn(E, OBS)
+        nxt = torch.randn(E, OBS)
+        roll.record(obs, torch.zeros(E, ACT), nxt, nxt, torch.zeros(E),
+                    torch.tensor([False]), torch.zeros(E))
+        assert low.episode_id[0, 0].item() == 0
+        assert low.episode_step[0, 0].item() == 0
+
+        obs2 = torch.randn(E, OBS)
+        nxt2 = torch.randn(E, OBS)
+        roll.record(obs2, torch.zeros(E, ACT), nxt2, nxt2, torch.zeros(E),
+                    torch.tensor([True]), torch.zeros(E))
+        assert low.episode_id[1, 0].item() == 0
+        assert low.episode_step[1, 0].item() == 1
+
+        obs3 = torch.randn(E, OBS)
+        nxt3 = torch.randn(E, OBS)
+        roll.record(obs3, torch.zeros(E, ACT), nxt3, nxt3, torch.zeros(E),
+                    torch.tensor([False]), torch.zeros(E))
+        assert low.episode_id[2, 0].item() == 1
+        assert low.episode_step[2, 0].item() == 0
+
 
 # ---------------------------------------------------------------------------
 # Reward accumulation
@@ -253,12 +279,29 @@ class TestBoundaryFixes:
         assert low.next_subgoal[0, 0].shape == (SG,)
 
     def test_manager_done_is_episode_end_only(self):
-        # F3: high-level done is 1 only on a true episode end, 0 on a c-boundary.
+        # F3: high-level done follows the TRUE termination mask, not the flush
+        # trigger. c-boundaries and pure horizon truncations should bootstrap.
         E, c = 1, 2
         agent, low, high, roll, sp = setup(E, c)
         roll.start(torch.randn(E, OBS))
         self._step(roll, E, episode_end=False)   # step 1
         self._step(roll, E, episode_end=False)    # step 2 -> c-boundary flush
         assert high.done[0].item() == 0.0         # mid-episode boundary: not done
-        self._step(roll, E, episode_end=True)     # episode-end flush (seg_len=1)
-        assert high.done[1].item() == 1.0         # real terminal: done
+
+        # Pure truncation: flushes, but manager should still bootstrap.
+        obs = torch.randn(E, OBS)
+        nxt = torch.randn(E, OBS)
+        roll.record(
+            obs, torch.zeros(E, ACT), nxt, nxt, torch.zeros(E),
+            torch.tensor([True]), torch.zeros(E),
+        )
+        assert high.done[1].item() == 0.0
+
+        # True terminal: flushes and marks done.
+        obs = torch.randn(E, OBS)
+        nxt = torch.randn(E, OBS)
+        roll.record(
+            obs, torch.zeros(E, ACT), nxt, nxt, torch.zeros(E),
+            torch.tensor([True]), torch.ones(E),
+        )
+        assert high.done[2].item() == 1.0

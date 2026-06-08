@@ -38,6 +38,7 @@ app = modal.App("train-hiro")
 )
 def train_hiro(
     env_id: str = "PickCube-v1",
+    subgoal_variant: str = "hybrid",
     robot_uids: str = "panda",
     control_mode: str = "pd_joint_delta_pos",
     seed: int = 1,
@@ -72,6 +73,8 @@ def train_hiro(
     pretrained_manager_ckpt: str = "",
     freeze_manager: bool = False,
     manager_input_mode: str = "full",
+    low_her_ratio: float = 0.0,
+    latent_subgoal_dim: int = 6,
     track: bool = False,
     capture_video: bool = True,
     save_freq_steps: int = 200_000,
@@ -89,6 +92,7 @@ def train_hiro(
 
     args = TrainArgs(
         env_id=env_id,
+        subgoal_variant=subgoal_variant,
         robot_uids=robot_uids,
         control_mode=control_mode,
         seed=seed,
@@ -115,6 +119,8 @@ def train_hiro(
         anneal_w=anneal_w,
         anneal_w_grasp_threshold=anneal_w_grasp_threshold,
         manager_utd_mult=manager_utd_mult,
+        low_her_ratio=low_her_ratio,
+        latent_subgoal_dim=latent_subgoal_dim,
         partial_reset=partial_reset,
         oracle_manager=oracle_manager,
         flat_worker=flat_worker,
@@ -169,6 +175,7 @@ def train_hiro(
 @app.local_entrypoint()
 def main(
     env_id: str = "PickCube-v1",
+    subgoal_variant: str = "hybrid",
     robot_uids: str = "panda",
     control_mode: str = "pd_joint_delta_pos",
     seed: int = 1,
@@ -181,11 +188,14 @@ def main(
     low_buffer_size: int = 100_000,
     high_buffer_size: int = 20_000,
     use_off_policy_correction: bool = True,
+    low_her_ratio: float = 0.8,
+    latent_subgoal_dim: int = 6,
     track: bool = False,
 ):
     """Foreground run. Defaults are SMOKE-sized; pass real sizes for a full run."""
     run_name, video_bytes = train_hiro.remote(
         env_id=env_id,
+        subgoal_variant=subgoal_variant,
         robot_uids=robot_uids,
         control_mode=control_mode,
         seed=seed,
@@ -198,6 +208,8 @@ def main(
         low_buffer_size=low_buffer_size,
         high_buffer_size=high_buffer_size,
         use_off_policy_correction=use_off_policy_correction,
+        low_her_ratio=low_her_ratio,
+        latent_subgoal_dim=latent_subgoal_dim,
         track=track,
     )
     print(f"Training complete. Run name: {run_name}")
@@ -213,6 +225,7 @@ def main(
 @app.local_entrypoint()
 def launch(
     env_id: str = "PickCube-v1",
+    subgoal_variant: str = "hybrid",
     robot_uids: str = "panda",
     control_mode: str = "pd_joint_delta_pos",
     seed: int = 1,
@@ -220,11 +233,14 @@ def launch(
     c: int = 10,
     subgoal_scale: float = 0.15,
     use_off_policy_correction: bool = True,
+    low_her_ratio: float = 0.8,
+    latent_subgoal_dim: int = 6,
     track: bool = True,
 ):
     """Detached spawn for a full run."""
     fc = train_hiro.spawn(
         env_id=env_id,
+        subgoal_variant=subgoal_variant,
         robot_uids=robot_uids,
         control_mode=control_mode,
         seed=seed,
@@ -232,6 +248,8 @@ def launch(
         c=c,
         subgoal_scale=subgoal_scale,
         use_off_policy_correction=use_off_policy_correction,
+        low_her_ratio=low_her_ratio,
+        latent_subgoal_dim=latent_subgoal_dim,
         track=track,
     )
     print(f"Spawned function call: {fc.object_id}")

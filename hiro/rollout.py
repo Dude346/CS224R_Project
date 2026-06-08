@@ -24,7 +24,8 @@ Per-step ordering (the bug-prone part), implemented in `record`:
   5. seg_reward += r_env;  seg_len += 1
   6. flush = (seg_len >= c) OR episode_end
   7. for flushing envs: push (s0, g0, seg_reward, s_c=s', intermediates, seg_len)
-     to high_buffer, then sample a fresh subgoal and reset segment state
+     to high_buffer with a manager done mask based on TRUE terminations only,
+     then sample a fresh subgoal and reset segment state
   8. non-flushing envs: cur_subgoal <- g_next
 
 Two different "next obs" must be passed in:
@@ -51,7 +52,7 @@ class HierarchicalRollout:
         self.device = torch.device(device)
 
         self.obs_dim = agent.sp.obs_dim
-        self.sg_dim = agent.sp.dim
+        self.sg_dim = agent.subgoal_dim
         self.act_dim = agent.cfg.action_dim
 
         E, c, dev = num_envs, self.c, self.device
@@ -62,6 +63,8 @@ class HierarchicalRollout:
         self.seg_len = torch.zeros(E, dtype=torch.long, device=dev)
         self.seg_obs = torch.zeros(E, c, self.obs_dim, device=dev)
         self.seg_act = torch.zeros(E, c, self.act_dim, device=dev)
+        self.low_episode_id = torch.zeros(E, dtype=torch.long, device=dev)
+        self.low_episode_step = torch.zeros(E, dtype=torch.long, device=dev)
 
     @torch.no_grad()
     def start(self, obs: torch.Tensor) -> torch.Tensor:
@@ -72,6 +75,8 @@ class HierarchicalRollout:
         self.seg_start_obs = obs.clone()
         self.seg_reward.zero_()
         self.seg_len.zero_()
+        self.low_episode_id.zero_()
+        self.low_episode_step.zero_()
         return self.cur_subgoal
 
     @torch.no_grad()
@@ -83,7 +88,7 @@ class HierarchicalRollout:
         resample_obs: torch.Tensor,   # (E, obs)  obs to start the next segment from
         r_env: torch.Tensor,          # (E,)      env reward
         episode_end: torch.Tensor,    # (E,) bool episode ended this step (flush trigger)
-        bootstrap_done: torch.Tensor, # (E,)      SAC done/bootstrap mask stored in buffers
+        bootstrap_done: torch.Tensor, # (E,)      TRUE termination mask used by both worker+manager critics
     ) -> torch.Tensor:
         """Process one vectorized transition; returns the updated cur_subgoal."""
         E, c = self.E, self.c
@@ -111,15 +116,15 @@ class HierarchicalRollout:
         idx = flush.nonzero(as_tuple=True)[0]
 
         # 5: flush completed segments to the high-level buffer (BEFORE resetting them).
-        #    The manager's done is the TRUE episode end (a c-boundary mid-episode is
-        #    NOT terminal for the manager — it has a successor segment to bootstrap).
+        #    The manager's done is the TRUE termination mask, not the flush trigger:
+        #    c-boundaries and pure horizon truncations should still bootstrap Q(s_c).
         if idx.numel() > 0:
             self.high.add_batch(
                 self.seg_start_obs[idx],
                 self.seg_subgoal[idx],
                 self.seg_reward[idx],
                 real_next_obs[idx],          # s_c = terminal obs of the segment
-                episode_end[idx].float(),    # F3: manager done = real episode end
+                bootstrap_done[idx].float(), # F3: manager done = true termination only
                 self.seg_obs[idx],
                 self.seg_act[idx],
                 self.seg_len[idx],
@@ -139,9 +144,16 @@ class HierarchicalRollout:
 
         # 7: store the worker transition with the corrected next subgoal.
         self.low.add(obs, self.cur_subgoal, action, r_lo, real_next_obs,
-                     worker_next_subgoal, bootstrap_done)
+                     worker_next_subgoal, bootstrap_done,
+                     episode_id=self.low_episode_id,
+                     episode_step=self.low_episode_step)
 
         # 8: commit segment-state resets for flushed envs and advance cur_subgoal.
+        self.low_episode_step = self.low_episode_step + 1
+        end_idx = episode_end.nonzero(as_tuple=True)[0]
+        if end_idx.numel() > 0:
+            self.low_episode_id[end_idx] = self.low_episode_id[end_idx] + 1
+            self.low_episode_step[end_idx] = 0
         if idx.numel() > 0:
             self.seg_subgoal[idx] = new_g
             self.seg_start_obs[idx] = resample_obs[idx]

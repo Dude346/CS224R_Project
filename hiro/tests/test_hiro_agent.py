@@ -20,7 +20,7 @@ import torch
 
 from hiro.hiro_agent import HIROAgent, HIROConfig
 from hiro.replay_buffer import HighLevelSample, LowLevelSample
-from hiro.subgoal_space import GRASP_DETECTORS, HIRO_SUBGOAL_SPACES
+from hiro.subgoal_space import GRASP_DETECTORS, HIRO_SUBGOAL_SPACES, OBJECT_CENTRIC_SUBGOAL_SPACES
 
 OBS, SG, ACT = 42, 6, 8          # PickCube-v1 HIRO subgoal space
 SCALE = 0.5
@@ -204,6 +204,129 @@ class TestActionSelection:
         assert torch.all(g.abs() <= SCALE + 1e-6)
 
 
+class TestWorkerRewardSelection:
+    def test_object_centric_pickcube_rewards_reaching_pregrasp(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(action_dim=ACT, c=5, subgoal_scale=SCALE, device="cpu")
+        ag = HIROAgent(sp, cfg)
+        ag.grasp_detector = lambda obs: obs[..., 18] > 0.5
+
+        # tcp_to_obj = obs[36:39]; not grasped (obs[18]=0). Moving the hand
+        # closer to the cube must be rewarded by the task-potential path.
+        s = torch.zeros(1, OBS)
+        s[:, 36] = 0.20
+        sn = torch.zeros(1, OBS)
+        sn[:, 36] = 0.10
+        g = torch.zeros(1, SG)
+
+        r = ag.worker_reward(s, g, sn)
+        assert r.shape == (1,)
+        assert r.item() > 0.0
+
+    def test_object_centric_pickcube_lifting_beats_holding(self):
+        """Agent-level guard for the bug that caused the plateau: once grasped,
+        moving the cube toward the goal must beat holding it static."""
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(action_dim=ACT, c=5, subgoal_scale=SCALE, device="cpu")
+        ag = HIROAgent(sp, cfg)
+        ag.grasp_detector = lambda obs: obs[..., 18] > 0.5
+
+        # grasped (obs[18]=1), gripper on cube (tcp_to_obj=0), cube 0.2 from goal.
+        s = torch.zeros(1, OBS)
+        s[:, 18] = 1.0
+        s[:, 39] = 0.20            # obj_to_goal = obs[39:42]
+        g = torch.zeros(1, SG)
+
+        sn_hold = s.clone()
+        sn_lift = s.clone()
+        sn_lift[:, 39] = 0.10      # cube halved its distance to the goal
+        r_hold = ag.worker_reward(s, g, sn_hold)
+        r_lift = ag.worker_reward(s, g, sn_lift)
+        assert r_lift.item() > r_hold.item()
+
+
+class TestLatentInterface:
+    def test_latent_object_centric_interface_has_requested_dim(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(
+            action_dim=ACT,
+            c=5,
+            subgoal_scale=SCALE,
+            latent_subgoal_dim=4,
+            latent_pretrain_steps=5,
+            latent_pretrain_batch_size=32,
+            device="cpu",
+        )
+        ag = HIROAgent(sp, cfg)
+        assert ag.latent_enabled is True
+        assert ag.subgoal_dim == 4
+
+    def test_latent_transition_roundtrip_shape(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(
+            action_dim=ACT,
+            c=5,
+            subgoal_scale=SCALE,
+            latent_subgoal_dim=4,
+            latent_pretrain_steps=5,
+            latent_pretrain_batch_size=32,
+            device="cpu",
+        )
+        ag = HIROAgent(sp, cfg)
+        obs = torch.randn(3, OBS)
+        z = ag.select_subgoal(obs)
+        next_obs = torch.randn(3, OBS)
+        z_next = ag.subgoal_transition(obs, z, next_obs)
+        assert z.shape == (3, 4)
+        assert z_next.shape == (3, 4)
+
+    def test_latent_worker_reward_decodes_geometric_goal(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(
+            action_dim=ACT,
+            c=5,
+            subgoal_scale=SCALE,
+            latent_subgoal_dim=4,
+            latent_pretrain_steps=5,
+            latent_pretrain_batch_size=32,
+            device="cpu",
+        )
+        ag = HIROAgent(sp, cfg)
+        ag.grasp_detector = lambda obs: obs[..., 18] > 0.5
+        s = torch.zeros(2, OBS)
+        z = ag.select_subgoal(s)
+        s_next = torch.zeros(2, OBS)
+        r = ag.worker_reward(s, z, s_next)
+        assert r.shape == (2,)
+
+    def test_latent_off_policy_correction_returns_latent_shape(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        latent_dim = 4
+        cfg = HIROConfig(
+            action_dim=ACT,
+            c=5,
+            subgoal_scale=SCALE,
+            latent_subgoal_dim=latent_dim,
+            latent_pretrain_steps=5,
+            latent_pretrain_batch_size=32,
+            device="cpu",
+        )
+        ag = HIROAgent(sp, cfg)
+        batch = HighLevelSample(
+            s0=torch.randn(8, OBS),
+            g0=(torch.rand(8, latent_dim) * 2 - 1) * 0.9,
+            reward_sum=torch.randn(8),
+            s_c=torch.randn(8, OBS),
+            done=torch.zeros(8),
+            inter_obs=torch.randn(8, 5, OBS),
+            inter_act=torch.rand(8, 5, ACT) * 2 - 1,
+            inter_len=torch.full((8,), 5, dtype=torch.long),
+        )
+        g = ag.off_policy_correct(batch)
+        assert g.shape == (8, latent_dim)
+        assert torch.all(torch.isfinite(g))
+
+
 # ---------------------------------------------------------------------------
 # Off-policy correction
 # ---------------------------------------------------------------------------
@@ -290,6 +413,40 @@ class TestUpdates:
             hi = ag.update_high(make_high(64, c=5))
             assert all(torch.isfinite(torch.tensor(v)) for v in lo.values())
             assert all(torch.isfinite(torch.tensor(v)) for v in hi.values())
+
+    def test_apply_low_her_relabels_subgoal_and_reward(self):
+        sp = OBJECT_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+        cfg = HIROConfig(action_dim=ACT, c=5, subgoal_scale=SCALE, device="cpu")
+        ag = HIROAgent(sp, cfg)
+        ag.grasp_detector = lambda obs: obs[..., 18] > 0.5
+
+        obs = torch.zeros(2, OBS)
+        next_obs = torch.zeros(2, OBS)
+        obs[0, 36] = 0.20
+        next_obs[0, 36] = 0.10
+        # Make sample 0 have a future achieved object-centric state.
+        future_obs = torch.zeros(2, OBS)
+        future_obs[0, 36] = 0.05
+        future_obs[0, 39] = 0.10
+        batch = LowLevelSample(
+            obs=obs,
+            subgoal=torch.zeros(2, SG),
+            action=torch.zeros(2, ACT),
+            reward=torch.zeros(2),
+            next_obs=next_obs,
+            next_subgoal=torch.zeros(2, SG),
+            done=torch.zeros(2),
+        )
+        mask = torch.tensor([True, False])
+        relabeled = ag.apply_low_her(batch, future_obs, mask)
+        expected_g0 = sp.project(future_obs[0:1]) - sp.project(obs[0:1])
+        assert torch.allclose(relabeled.subgoal[0:1], expected_g0)
+        assert torch.allclose(relabeled.subgoal[1], batch.subgoal[1])
+        expected_next = ag.subgoal_transition(obs[0:1], expected_g0, next_obs[0:1])
+        assert torch.allclose(relabeled.next_subgoal[0:1], expected_next)
+        expected_reward = ag.worker_reward(obs[0:1], expected_g0, next_obs[0:1])
+        assert torch.allclose(relabeled.reward[0:1], expected_reward)
+        assert relabeled.reward[0].item() != ag.worker_reward(obs[0:1], batch.subgoal[0:1], next_obs[0:1]).item()
 
 
 # ---------------------------------------------------------------------------

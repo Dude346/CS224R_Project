@@ -227,6 +227,48 @@ class SquashedGaussianActor(nn.Module):
         return log_prob.sum(-1, keepdim=True)
 
 
+class SubgoalLatentCodec(nn.Module):
+    """Small MLP autoencoder for a bounded latent subgoal interface.
+
+    The encoder maps geometric subgoals -> latent codes in [-latent_scale, +latent_scale]
+    via tanh. The decoder maps latent codes back to geometric subgoals.
+    """
+
+    def __init__(
+        self,
+        base_dim: int,
+        latent_dim: int,
+        latent_scale: ScaleLike = 1.0,
+        hidden_dim: int = 128,
+        n_hidden: int = 2,
+    ):
+        super().__init__()
+        self.base_dim = base_dim
+        self.latent_dim = latent_dim
+
+        self.encoder_backbone = _mlp_trunk(base_dim, hidden_dim, n_hidden)
+        self.encoder_head = nn.Linear(hidden_dim, latent_dim)
+        self.decoder = nn.Sequential(
+            _mlp_trunk(latent_dim, hidden_dim, n_hidden),
+            nn.Linear(hidden_dim, base_dim),
+        )
+
+        scale_t = _as_dim_buffer(latent_scale, latent_dim, "latent_scale")
+        self.register_buffer("latent_scale", scale_t)
+
+    def encode(self, g_base: torch.Tensor) -> torch.Tensor:
+        h = self.encoder_backbone(g_base)
+        z = torch.tanh(self.encoder_head(h))
+        return z * self.latent_scale
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        z_scaled = z / self.latent_scale.clamp_min(1e-6)
+        return self.decoder(z_scaled)
+
+    def reconstruct(self, g_base: torch.Tensor) -> torch.Tensor:
+        return self.decode(self.encode(g_base))
+
+
 # ---------------------------------------------------------------------------
 # Convenience builder: wires the four nets with the correct dims in one place
 # so the manager/worker asymmetry is documented exactly once.

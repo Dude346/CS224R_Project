@@ -31,11 +31,12 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
-from hiro.networks import HIRONetworks, TwinCritic, build_hiro_networks
+from hiro.networks import HIRONetworks, SubgoalLatentCodec, TwinCritic, build_hiro_networks
 from hiro.replay_buffer import HighLevelSample, LowLevelSample
 from hiro.subgoal_space import SubgoalSpace
 
@@ -47,8 +48,8 @@ class HIROConfig:
     subgoal_scale: float = 0.15         # |displacement| bound; scalar or per-dim
     action_low: float = -1.0
     action_high: float = 1.0
-    gamma_low: float = 0.95
-    gamma_high: float = 0.8             # bounded manager value (avoids Q divergence)
+    gamma_low: float = 0.8
+    gamma_high: float = 0.97            # longer-horizon manager for transport stability
     tau: float = 0.005                  # soft target update rate
     max_grad_norm: float = 10.0         # critic/actor grad clip; 0 disables
     policy_lr: float = 3e-4
@@ -90,6 +91,16 @@ class HIROConfig:
     # A manager trained on these body-independent dims transfers across robots with
     # different obs sizes (e.g. panda 42-D -> fetch 54-D); the worker stays full-obs.
     manager_input_dims: tuple = ()
+    # Latent subgoal codec (latent_object_centric variant): >0 enables a learned
+    # latent code over the geometric subgoal space (0 = disabled; default path).
+    latent_subgoal_dim: int = 0
+    latent_hidden_dim: int = 128
+    latent_pretrain_steps: int = 1000
+    latent_pretrain_batch_size: int = 256
+    latent_pretrain_range: float = 2.0  # sample geometric subgoals over +/- range*scale (telescoped
+                                        # residuals routinely exceed the manager's one-step bound)
+    latent_lr: float = 1e-3
+    low_her_ratio: float = 0.8          # fraction of worker batch relabeled with future achieved goals
     hidden_dim: int = 256
     n_hidden: int = 3
     device: str = "cpu"
@@ -115,7 +126,10 @@ class HIROAgent:
         self.num_candidates = cfg.num_candidates
 
         obs_dim = subgoal_space.obs_dim
-        sg_dim = subgoal_space.dim
+        self.base_subgoal_dim = subgoal_space.dim
+        self.latent_enabled = cfg.latent_subgoal_dim > 0
+        self.subgoal_dim = cfg.latent_subgoal_dim if self.latent_enabled else self.base_subgoal_dim
+        sg_dim = self.subgoal_dim
         act_dim = cfg.action_dim
 
         # Body-independent manager: it observes only obs[manager_input_dims]
@@ -124,14 +138,32 @@ class HIROAgent:
         self._mgr_dims = list(cfg.manager_input_dims) if cfg.manager_input_dims else None
         manager_obs_dim = len(self._mgr_dims) if self._mgr_dims is not None else obs_dim
 
+        base_scale = torch.as_tensor(cfg.subgoal_scale, dtype=torch.float32, device=self.device)
+        if base_scale.ndim == 0:
+            base_scale = base_scale.expand(self.base_subgoal_dim).clone()
+        self.base_scale = base_scale
+
         # --- networks (online) ---
         self.nets: HIRONetworks = build_hiro_networks(
             obs_dim=obs_dim, subgoal_dim=sg_dim, action_dim=act_dim,
             action_low=cfg.action_low, action_high=cfg.action_high,
-            subgoal_scale=cfg.subgoal_scale,
+            subgoal_scale=1.0 if self.latent_enabled else cfg.subgoal_scale,
             hidden_dim=cfg.hidden_dim, n_hidden=cfg.n_hidden,
             manager_obs_dim=manager_obs_dim,
         ).to(self.device)
+
+        self.latent_codec = None
+        if self.latent_enabled:
+            self.latent_codec = SubgoalLatentCodec(
+                base_dim=self.base_subgoal_dim,
+                latent_dim=sg_dim,
+                latent_scale=1.0,
+                hidden_dim=cfg.latent_hidden_dim,
+                n_hidden=2,
+            ).to(self.device)
+            self._pretrain_latent_codec()
+            for p in self.latent_codec.parameters():
+                p.requires_grad_(False)
 
         # --- target critics (frozen copies) ---
         self.worker_critic_target = self._make_target(self.nets.worker_critic)
@@ -157,12 +189,8 @@ class HIROAgent:
             cfg.policy_lr, cfg.q_lr, cfg.alpha_lr, target_entropy=te_high,
         )
 
-        # --- subgoal bounds / candidate noise (per-dim tensors on device) ---
-        scale = torch.as_tensor(cfg.subgoal_scale, dtype=torch.float32, device=self.device)
-        if scale.ndim == 0:
-            scale = scale.expand(sg_dim).clone()
-        self.scale = scale                                   # (sg_dim,)
-        self.candidate_std = cfg.candidate_std_scale * scale  # (sg_dim,)
+        # --- candidate noise for the off-policy correction (per-dim, on device) ---
+        self.candidate_std = cfg.candidate_std_scale * self.base_scale  # (base_sg_dim,)
 
         # Optional grasp detector (set by the trainer from the env id). When present
         # AND the subgoal space has object dims, the worker uses the phase-aware
@@ -197,15 +225,57 @@ class HIROAgent:
             for p, tp in zip(online.parameters(), target.parameters()):
                 tp.data.mul_(1 - tau).add_(tau * p.data)
 
+    def _pretrain_latent_codec(self) -> None:
+        if self.latent_codec is None or self.cfg.latent_pretrain_steps <= 0:
+            return
+        optim = torch.optim.Adam(self.latent_codec.parameters(), lr=self.cfg.latent_lr)
+        B = self.cfg.latent_pretrain_batch_size
+        rng = self.cfg.latent_pretrain_range
+        latent_scale = self.latent_codec.latent_scale
+        self.latent_codec.train()
+        for _ in range(self.cfg.latent_pretrain_steps):
+            # (1) reconstruction on geometric subgoals over a WIDER range than the
+            #     manager's one-step bound, since telescoped residuals exceed it.
+            g_base = (
+                torch.rand(B, self.base_subgoal_dim, device=self.device) * 2.0 - 1.0
+            ) * (self.base_scale * rng)
+            recon = self.latent_codec.reconstruct(g_base)
+            recon_loss = F.mse_loss(recon, g_base)
+            # (2) latent cycle-consistency: the manager emits codes across the FULL
+            #     [-latent_scale, latent_scale] cube, so `decode` must be a right
+            #     inverse of `encode` there -- otherwise large parts of the manager's
+            #     action space decode to extrapolated garbage subgoals.
+            z = (torch.rand(B, self.subgoal_dim, device=self.device) * 2.0 - 1.0) * latent_scale
+            z_cycle = self.latent_codec.encode(self.latent_codec.decode(z))
+            cycle_loss = F.mse_loss(z_cycle, z)
+            loss = recon_loss + cycle_loss
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+        self.latent_codec.eval()
+
+    def encode_subgoal(self, g_base: torch.Tensor) -> torch.Tensor:
+        if self.latent_codec is None:
+            return g_base
+        return self.latent_codec.encode(g_base)
+
+    def decode_subgoal(self, g_interface: torch.Tensor) -> torch.Tensor:
+        if self.latent_codec is None:
+            return g_interface
+        return self.latent_codec.decode(g_interface)
+
     # ------------------------------------------------------------------
     # subgoal-space delegates (so the trainer can call through the agent)
     # ------------------------------------------------------------------
 
     def subgoal_transition(self, s, g, s_next):
-        return self.sp.subgoal_transition(s, g, s_next)
+        g_base = self.decode_subgoal(g)
+        g_next_base = self.sp.subgoal_transition(s, g_base, s_next)
+        return self.encode_subgoal(g_next_base)
 
     def intrinsic_reward(self, s, g, s_next):
-        return self.sp.intrinsic_reward(s, g, s_next)
+        g_base = self.decode_subgoal(g)
+        return self.sp.intrinsic_reward(s, g_base, s_next)
 
     @torch.no_grad()
     def worker_reward(self, s, g, s_next, env_reward=None):
@@ -229,14 +299,25 @@ class HIROAgent:
             or not self.sp.object_positions
             or self.cfg.pbrs_alpha <= 0.0
         ):
-            intrinsic = self.sp.intrinsic_reward(s, g, s_next)
+            intrinsic = self.intrinsic_reward(s, g, s_next)
         else:
+            g_base = self.decode_subgoal(g)
             is_grasped_s = self.grasp_detector(s)
             is_grasped_s_next = self.grasp_detector(s_next)
-            intrinsic = self.sp.phased_pbrs_intrinsic_reward(
-                s, g, s_next, is_grasped_s, is_grasped_s_next,
-                gamma=self.cfg.gamma_low, alpha=self.cfg.pbrs_alpha,
-            )
+            # Object-centric spaces use the farming-proof task-potential reward
+            # (telescoping shaping that mirrors the env's reach/grasp/place reward);
+            # all other spaces use the grasp-gated phased PBRS reward.
+            if self.sp.reward_mode == "pickcube_task_potential":
+                intrinsic = self.sp.task_potential_intrinsic_reward(
+                    s, g_base, s_next, is_grasped_s, is_grasped_s_next,
+                    reach_coef=1.0, grasp_coef=1.0, place_coef=1.0,
+                    object_progress_coef=2.0, tanh_temp=5.0,
+                )
+            else:
+                intrinsic = self.sp.phased_pbrs_intrinsic_reward(
+                    s, g_base, s_next, is_grasped_s, is_grasped_s_next,
+                    gamma=self.cfg.gamma_low, alpha=self.cfg.pbrs_alpha,
+                )
 
         # Phase D: pre-grasp reach-to-cube PBRS bootstrap (object-anchored, non-farmable).
         #   Phi(s) = w_reach * (1 - tanh(5*||tcp-cube||));  shaping = gamma_low*Phi(s') - Phi(s)
@@ -294,22 +375,26 @@ class HIROAgent:
         B, c, obs_dim = inter_obs.shape
         act_dim = inter_act.shape[-1]
         K = self.num_candidates
-        sg_dim = sp.dim
+        base_sg_dim = self.base_subgoal_dim
+        iface_sg_dim = self.subgoal_dim
 
-        proj_s0 = sp.project(s0)                  # (B, sg)
-        proj_sc = sp.project(s_c)                 # (B, sg)
-        diff = proj_sc - proj_s0                  # achieved displacement (B, sg)
+        proj_s0 = sp.project(s0)                  # (B, base_sg)
+        proj_sc = sp.project(s_c)                 # (B, base_sg)
+        diff = proj_sc - proj_s0                  # achieved displacement (B, base_sg)
 
         # Candidate subgoals: original, achieved, then Gaussian around achieved.
-        cands = torch.empty(B, K, sg_dim, device=s0.device)
-        cands[:, 0] = batch.g0
+        cands = torch.empty(B, K, base_sg_dim, device=s0.device)
+        if self.latent_enabled:
+            cands[:, 0] = self.decode_subgoal(batch.g0)
+        else:
+            cands[:, 0] = batch.g0
         cands[:, 1] = diff
         if K > 2:
-            noise = torch.randn(B, K - 2, sg_dim, device=s0.device) * self.candidate_std
+            noise = torch.randn(B, K - 2, base_sg_dim, device=s0.device) * self.candidate_std
             cands[:, 2:] = diff.unsqueeze(1) + noise
-        # Clip to the manager's subgoal range [-scale, scale] (per-dim).
-        cands = torch.minimum(cands, self.scale)
-        cands = torch.maximum(cands, -self.scale)
+        # Clip to the GEOMETRIC subgoal range [-base_scale, base_scale] (per-dim).
+        cands = torch.minimum(cands, self.base_scale)
+        cands = torch.maximum(cands, -self.base_scale)
 
         # Induced subgoal at each intermediate step for each candidate:
         #   g~_{i,k} = proj(s0) + g~_k - proj(s_i)
@@ -320,12 +405,21 @@ class HIROAgent:
             - proj_inter[:, None, :, :]
         )                                          # (B, K, c, sg)
 
+        if self.latent_enabled:
+            latent_cands = self.encode_subgoal(cands.reshape(B * K, base_sg_dim)).reshape(B, K, iface_sg_dim)
+            latent_induced = self.encode_subgoal(
+                induced.reshape(B * K * c, base_sg_dim)
+            ).reshape(B, K, c, iface_sg_dim)
+        else:
+            latent_cands = cands
+            latent_induced = induced
+
         obs_exp = inter_obs[:, None, :, :].expand(B, K, c, obs_dim)   # (B,K,c,obs)
-        state = torch.cat([obs_exp, induced], dim=-1)                 # (B,K,c,obs+sg)
+        state = torch.cat([obs_exp, latent_induced], dim=-1)          # (B,K,c,obs+sg)
         act_exp = inter_act[:, None, :, :].expand(B, K, c, act_dim)   # (B,K,c,act)
 
         logp = self.nets.worker_actor.action_log_prob(
-            state.reshape(B * K * c, obs_dim + sg_dim),
+            state.reshape(B * K * c, obs_dim + iface_sg_dim),
             act_exp.reshape(B * K * c, act_dim),
         ).reshape(B, K, c)                                            # (B,K,c)
 
@@ -335,7 +429,7 @@ class HIROAgent:
         score = (logp * valid[:, None, :]).sum(dim=-1)               # (B,K)
 
         best = score.argmax(dim=1)                                   # (B,)
-        return cands[torch.arange(B, device=s0.device), best]       # (B, sg)
+        return latent_cands[torch.arange(B, device=s0.device), best]  # (B, interface_sg)
 
     # ------------------------------------------------------------------
     # SAC updates
@@ -428,6 +522,55 @@ class HIROAgent:
         phi_sc = -beta * torch.norm(s_c[..., dims], dim=-1)    # (B,)
         return self.cfg.gamma_high * phi_sc * (1.0 - done.float()) - phi_s0
 
+    @torch.no_grad()
+    def apply_low_her(
+        self,
+        batch: LowLevelSample,
+        future_next_obs: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> LowLevelSample:
+        """Relabel a worker batch with future achieved goals from the same episode.
+
+        Hindsight goal in geometric subgoal space:
+            g_her = project(s_future) - project(s)
+        i.e. make the subgoal target equal to a state that was actually achieved
+        later in the same episode. The relabeled next_subgoal and worker reward
+        are then recomputed under the current worker reward definition.
+        """
+        if mask is None:
+            mask = torch.ones(batch.obs.shape[0], dtype=torch.bool, device=batch.obs.device)
+        if mask.ndim != 1 or mask.shape[0] != batch.obs.shape[0]:
+            raise ValueError("mask must be shape (B,)")
+        if not mask.any():
+            return batch
+
+        obs = batch.obs
+        achieved = future_next_obs.to(obs.device)
+        g_base = self.sp.project(achieved) - self.sp.project(obs)
+        g_interface = self.encode_subgoal(g_base)
+
+        subgoal = batch.subgoal.clone()
+        next_subgoal = batch.next_subgoal.clone()
+        reward = batch.reward.clone()
+
+        subgoal[mask] = g_interface[mask]
+        next_subgoal[mask] = self.subgoal_transition(obs[mask], g_interface[mask], batch.next_obs[mask])
+        reward[mask] = self.worker_reward(obs[mask], g_interface[mask], batch.next_obs[mask])
+
+        return LowLevelSample(
+            obs=batch.obs,
+            subgoal=subgoal,
+            action=batch.action,
+            reward=reward,
+            next_obs=batch.next_obs,
+            next_subgoal=next_subgoal,
+            done=batch.done,
+            t_inds=batch.t_inds,
+            e_inds=batch.e_inds,
+            episode_id=batch.episode_id,
+            episode_step=batch.episode_step,
+        )
+
     def update_high(self, batch: HighLevelSample) -> dict:
         """SAC update for the manager, after off-policy relabeling of the action.
 
@@ -460,7 +603,7 @@ class HIROAgent:
     # ------------------------------------------------------------------
 
     def state_dict(self) -> dict:
-        return {
+        sd = {
             "worker_actor": self.nets.worker_actor.state_dict(),
             "worker_critic": self.nets.worker_critic.state_dict(),
             "worker_critic_target": self.worker_critic_target.state_dict(),
@@ -470,6 +613,9 @@ class HIROAgent:
             "log_alpha_low": self.log_alpha_low.detach(),
             "log_alpha_high": self.log_alpha_high.detach(),
         }
+        if self.latent_codec is not None:
+            sd["latent_codec"] = self.latent_codec.state_dict()
+        return sd
 
     def load_state_dict(self, sd: dict) -> None:
         self.nets.worker_actor.load_state_dict(sd["worker_actor"])
@@ -478,6 +624,8 @@ class HIROAgent:
         self.nets.manager_actor.load_state_dict(sd["manager_actor"])
         self.nets.manager_critic.load_state_dict(sd["manager_critic"])
         self.manager_critic_target.load_state_dict(sd["manager_critic_target"])
+        if self.latent_codec is not None and "latent_codec" in sd:
+            self.latent_codec.load_state_dict(sd["latent_codec"])
         with torch.no_grad():
             self.log_alpha_low.copy_(sd["log_alpha_low"].to(self.device))
             self.log_alpha_high.copy_(sd["log_alpha_high"].to(self.device))

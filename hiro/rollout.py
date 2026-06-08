@@ -116,15 +116,19 @@ class HierarchicalRollout:
         idx = flush.nonzero(as_tuple=True)[0]
 
         # 5: flush completed segments to the high-level buffer (BEFORE resetting them).
-        #    The manager's done is the TRUE termination mask, not the flush trigger:
-        #    c-boundaries and pure horizon truncations should still bootstrap Q(s_c).
+        #    The manager's done is the TRUE-TERMINATION mask (bootstrap_done), NOT the
+        #    flush trigger episode_end. A c-boundary mid-episode is not terminal (it has
+        #    a successor segment), and crucially neither is a horizon TRUNCATION: the
+        #    episode was only time-limited, so the manager must still bootstrap Q(s_c)
+        #    from it — exactly like the worker. bootstrap_done is 1 only on a genuine env
+        #    termination (e.g. PickCube success); under ignore_terminations it is all-zeros.
         if idx.numel() > 0:
             self.high.add_batch(
                 self.seg_start_obs[idx],
                 self.seg_subgoal[idx],
                 self.seg_reward[idx],
                 real_next_obs[idx],          # s_c = terminal obs of the segment
-                bootstrap_done[idx].float(), # F3: manager done = true termination only
+                bootstrap_done[idx].float(), # manager done = TRUE termination only, not truncation
                 self.seg_obs[idx],
                 self.seg_act[idx],
                 self.seg_len[idx],

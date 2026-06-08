@@ -256,12 +256,14 @@ class TestRewardAccumulation:
 # ---------------------------------------------------------------------------
 
 class TestBoundaryFixes:
-    def _step(self, roll, E, episode_end=False):
+    def _step(self, roll, E, episode_end=False, terminal=False):
+        # episode_end = flush trigger (truncation OR termination);
+        # terminal = TRUE env termination -> bootstrap_done (manager/worker SAC done).
         obs = torch.randn(E, OBS)
         nxt = torch.randn(E, OBS)
         return roll.record(
             obs, torch.zeros(E, ACT), nxt, nxt, torch.zeros(E),
-            torch.tensor([episode_end] * E), torch.zeros(E),
+            torch.tensor([episode_end] * E), torch.tensor([float(terminal)] * E),
         )
 
     def test_worker_next_subgoal_at_boundary_is_fresh_goal(self):

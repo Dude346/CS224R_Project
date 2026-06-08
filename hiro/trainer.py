@@ -64,7 +64,7 @@ class TrainArgs:
     subgoal_scale: float = 0.15
     subgoal_mode: str = "hiro"        # "hiro" (tcp+object) | "cube_centric" (object-only, Phase 5)
     gamma_low: float = 0.95
-    gamma_high: float = 0.8
+    gamma_high: float = 0.95           # was 0.8; low value made manager too myopic (0.8^4=0.41 at end)
     tau: float = 0.005
     use_phased_reward: bool = True
     pbrs_alpha: float = 0.5            # PBRS grasp potential strength (replaces grasp_bonus)
@@ -113,6 +113,10 @@ class TrainArgs:
     # Hindsight (HER) relabeling of worker subgoals. 0.0 = off (default path); the
     # latent / object-centric runs enable it with --low-her-ratio 0.8.
     low_her_ratio: float = 0.0
+    # Dense pre-grasp hand->object reach term in phased PBRS (reward-tuning branch).
+    # 0.0 = off (default path preserved); the reach-fix runs set --reach-coef 1.0.
+    reach_coef: float = 0.0
+    reach_temp: float = 5.0            # tanh sharpness of the reach term
     # partial_reset=True: episodes end on TRUE termination (env success), not just
     # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
     # success). Flat SAC baselines used False to match upstream.
@@ -336,6 +340,7 @@ def train(args: TrainArgs) -> str:
         manager_input_dims=mgr_dims,
         low_her_ratio=args.low_her_ratio,
         latent_subgoal_dim=latent_subgoal_dim,
+        reach_coef=args.reach_coef, reach_temp=args.reach_temp,
         device=args.device,
     )
     agent = HIROAgent(sp, cfg)
@@ -354,6 +359,7 @@ def train(args: TrainArgs) -> str:
         print(f"phased worker reward (PBRS): detector={'set' if agent.grasp_detector else 'NONE'} "
               f"| subgoal_variant={variant_key} "
               f"| object_dims={sp.object_positions} | pbrs_alpha={args.pbrs_alpha} "
+              f"| reach_coef={args.reach_coef} reach_temp={args.reach_temp} "
               f"| gamma_low={args.gamma_low}")
     if args.worker_extrinsic_weight > 0.0:
         print(f"HYBRID worker reward: r = {1-args.worker_extrinsic_weight:.2f}*intrinsic "
@@ -466,14 +472,7 @@ def train(args: TrainArgs) -> str:
             next_obs, reward, terminations, truncations, infos = envs.step(action)
             episode_end = (truncations | terminations).bool()
             real_next_obs = next_obs.clone()
-            # bootstrap_done = 1 only on TRUE env terminations (success), so the
-            # worker doesn't extrapolate Q past a real terminal state. Under
-            # ignore_terminations=True (partial_reset=False) the wrapper forces
-            # terminations to all-False, so this is all-zeros == "always bootstrap"
-            # (matches the old behaviour). Under partial_reset=True, this stops
-            # the worker from bootstrapping past success — critical when shaping
-            # rewards (PBRS) charge per-step costs.
-            bootstrap_done = terminations.float()
+            bootstrap_done = torch.zeros(args.num_envs, device=device)
             if "final_info" in infos:
                 need_final = episode_end
                 real_next_obs[need_final] = infos["final_observation"][need_final]

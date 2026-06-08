@@ -162,12 +162,15 @@ class SubgoalSpace:
         is_grasped_s_next: torch.Tensor,  # (...,) is_grasped at the next state s'
         gamma: float,                   # MUST equal the worker's MDP discount factor (gamma_low)
         alpha: float,                   # strength of the grasp potential
+        reach_coef: float = 0.0,        # strength of the dense pre-grasp object-reach term
+        reach_temp: float = 5.0,        # tanh sharpness of the reach term (in 1/units of the subgoal space)
     ) -> torch.Tensor:                  # (...,)
         """Phase-aware worker reward with potential-based grasp shaping (Ng et al. 1999).
 
             r = -||hand_residual||                                  always active
               + is_grasped(s) * (-||object_residual||)              gated by current grasp
               + γ·α·is_grasped(s')  −  α·is_grasped(s)              PBRS shaping
+              + reach_coef·(1 - tanh(reach_temp·||obj - hand||))    dense hand→object reach term
 
         The PBRS term is policy-invariant by Ng's theorem: every drop-regrasp
         cycle costs α(1−γ), so the grasp signal cannot be farmed. γ must equal
@@ -180,6 +183,27 @@ class SubgoalSpace:
           - drop step (s=T, s'=F): cube term ON with the residual-at-drop, plus
             the PBRS -α. Drops at the goal (cube_residual ≈ 0) only pay -α;
             drops in transit get the position-proportional cube penalty too.
+
+        The REACH term (reach_coef > 0) is the fix for the grasp-discovery
+        deadlock: HIRO's subgoal-distance reward gives the gripper dimension no
+        gradient, and a grasp only fires when the hand is ON the object — which
+        the untrained manager's TCP subgoal never reliably achieves. So the
+        worker never explores the gripper-close near the object and never learns
+        to grasp (verified empirically in hiro/smoke_pipeline.py: grasp_rate
+        stays 0 for any PBRS α). This dense term continuously pulls the hand to
+        the object, so the "near object" precondition is satisfied, ordinary
+        entropy exploration discovers the grasp, and grasp_rate lifts off. It is
+        computed from the hand→object displacement in the subgoal-space positions
+        themselves (positions only, no contact forces), so it is embodiment-
+        independent.
+
+        It is deliberately NOT gated by is_grasped: gating it off on grasp would
+        make grasping a reward CLIFF (the worker would lose the up-to-reach_coef
+        bonus the instant it grasps), so it learns to hover near the object and
+        never close the gripper — confirmed empirically (grasp_rate collapses).
+        Left ungated, the bonus persists after grasping (tcp ≈ object while held),
+        so it instead reinforces keeping the object in hand; the object subgoal
+        term then drives where to carry it.
 
         `hand_positions` / `object_positions` are positions within the subgoal
         vector; only `indices` differ between HIRO (absolute positions) and
@@ -195,7 +219,22 @@ class SubgoalSpace:
         igs = is_grasped_s.to(hand_term.dtype)
         igs_next = is_grasped_s_next.to(hand_term.dtype)
         pbrs = gamma * alpha * igs_next - alpha * igs
-        return hand_term + igs * cube_term + pbrs
+
+        reach = torch.zeros_like(hand_term)
+        if (
+            reach_coef > 0.0
+            and self.object_positions
+            and len(self.hand_positions) == len(self.object_positions)
+        ):
+            proj_next = self.project(s_next)
+            hand_to_obj = (
+                proj_next[..., self.object_positions]
+                - proj_next[..., self.hand_positions]
+            )
+            dist = torch.norm(hand_to_obj, dim=-1)
+            reach = reach_coef * (1.0 - torch.tanh(reach_temp * dist))
+
+        return hand_term + igs * cube_term + pbrs + reach
 
     def task_potential_intrinsic_reward(
         self,

@@ -101,6 +101,10 @@ class HIROConfig:
                                         # residuals routinely exceed the manager's one-step bound)
     latent_lr: float = 1e-3
     low_her_ratio: float = 0.8          # fraction of worker batch relabeled with future achieved goals
+    # Dense pre-grasp hand->object reach term inside phased PBRS (reward-tuning
+    # branch). 0.0 = off (default path preserved); >0 fixes grasp-discovery.
+    reach_coef: float = 0.0
+    reach_temp: float = 5.0             # tanh sharpness of the reach term
     hidden_dim: int = 256
     n_hidden: int = 3
     device: str = "cpu"
@@ -317,6 +321,7 @@ class HIROAgent:
                 intrinsic = self.sp.phased_pbrs_intrinsic_reward(
                     s, g_base, s_next, is_grasped_s, is_grasped_s_next,
                     gamma=self.cfg.gamma_low, alpha=self.cfg.pbrs_alpha,
+                    reach_coef=self.cfg.reach_coef, reach_temp=self.cfg.reach_temp,
                 )
 
         # Phase D: pre-grasp reach-to-cube PBRS bootstrap (object-anchored, non-farmable).

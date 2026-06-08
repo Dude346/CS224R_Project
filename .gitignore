@@ -227,3 +227,16 @@ run_artifacts/
 run_artifacts_*/
 videos/
 media_outputs/
+archive_videos/
+hiro_decision_videos/
+hiro_diag_w100_videos*
+hiro_final_videos/
+
+# Model checkpoints (large binaries; kept locally, not tracked)
+checkpoints/
+panda_checkpoints/
+*.pt
+
+# Scratch working notes
+experiments/CLAUDE_CHAT_*.md
+experiments/PAPER_SUMMARY.md

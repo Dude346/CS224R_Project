@@ -415,3 +415,53 @@ class TestCheckpoint:
                          ag2.nets.worker_actor.parameters()):
             assert torch.allclose(p, p2)
         assert torch.allclose(ag.log_alpha_low, ag2.log_alpha_low)
+
+
+# ---------------------------------------------------------------------------
+# Body-independent manager (Option-B cross-robot transfer). The manager reads
+# only obs[manager_input_dims] (9-D [tcp,cube,goal]) so its weights transfer
+# across robots with different obs sizes. Default (no dims) = full obs, unchanged.
+# ---------------------------------------------------------------------------
+
+from hiro.subgoal_space import (  # noqa: E402
+    CUBE_CENTRIC_SUBGOAL_SPACES,
+    FETCH_CUBE_CENTRIC_SUBGOAL_SPACES,
+    MANAGER_INPUT_DIMS,
+    FETCH_MANAGER_INPUT_DIMS,
+)
+
+
+def _bi_agent(sp, mgr_dims):
+    cfg = HIROConfig(action_dim=8, manager_input_dims=tuple(mgr_dims),
+                     use_off_policy_correction=False, device="cpu")
+    return HIROAgent(sp, cfg)
+
+
+def test_bi_manager_slices_and_selects():
+    sp = CUBE_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]     # obs_dim 42, sg 3
+    ag = _bi_agent(sp, MANAGER_INPUT_DIMS["PickCube-v1"])  # 9-D manager input
+    assert ag._mgr_dims == list(MANAGER_INPUT_DIMS["PickCube-v1"])
+    # If the manager net were sized to the full 42-D obs, feeding the 9-D slice
+    # would raise a shape error -- so a clean call proves the net is 9-D.
+    g = ag.select_subgoal(torch.randn(4, 42), deterministic=True)
+    assert g.shape == (4, sp.dim)
+
+
+def test_bi_manager_transfers_across_obs_sizes():
+    ag_panda = _bi_agent(CUBE_CENTRIC_SUBGOAL_SPACES["PickCube-v1"],
+                          MANAGER_INPUT_DIMS["PickCube-v1"])        # obs 42
+    ag_fetch = _bi_agent(FETCH_CUBE_CENTRIC_SUBGOAL_SPACES["PickCube-v1"],
+                         FETCH_MANAGER_INPUT_DIMS["PickCube-v1"])   # obs 54
+    # The whole point: a panda-trained body-independent manager loads onto the
+    # fetch agent without a shape mismatch (both managers have a 9-D input).
+    ag_fetch.load_manager(ag_panda.state_dict())
+    g = ag_fetch.select_subgoal(torch.randn(2, 54), deterministic=True)
+    assert g.shape == (2, 3)
+
+
+def test_full_obs_manager_is_default():
+    sp = CUBE_CENTRIC_SUBGOAL_SPACES["PickCube-v1"]
+    ag = HIROAgent(sp, HIROConfig(action_dim=8, use_off_policy_correction=False, device="cpu"))
+    assert ag._mgr_dims is None
+    g = ag.select_subgoal(torch.randn(3, 42), deterministic=True)
+    assert g.shape == (3, sp.dim)

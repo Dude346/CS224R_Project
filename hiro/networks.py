@@ -256,6 +256,7 @@ def build_hiro_networks(
     subgoal_scale: ScaleLike = 0.5,
     hidden_dim: int = 256,
     n_hidden: int = 3,
+    manager_obs_dim: "int | None" = None,
 ) -> HIRONetworks:
     """Construct the four HIRO networks with the correct (asymmetric) dims.
 
@@ -279,13 +280,17 @@ def build_hiro_networks(
         hidden_dim=hidden_dim, n_hidden=n_hidden,
     )
 
+    # Manager input dim defaults to the full obs (original behaviour). A smaller
+    # manager_obs_dim is used for the body-independent (object-feature) manager,
+    # whose learned weights can transfer across robots with different obs sizes.
+    m_obs = obs_dim if manager_obs_dim is None else int(manager_obs_dim)
     scale_t = _as_dim_buffer(subgoal_scale, subgoal_dim, "subgoal_scale")
     manager_actor = SquashedGaussianActor(
-        in_dim=obs_dim, out_dim=subgoal_dim,
+        in_dim=m_obs, out_dim=subgoal_dim,
         low=-scale_t, high=scale_t, hidden_dim=hidden_dim, n_hidden=n_hidden,
     )
     manager_critic = TwinCritic(
-        x_dim=obs_dim, a_dim=subgoal_dim,
+        x_dim=m_obs, a_dim=subgoal_dim,
         hidden_dim=hidden_dim, n_hidden=n_hidden,
     )
     return HIRONetworks(worker_actor, worker_critic, manager_actor, manager_critic)

@@ -529,3 +529,50 @@ class TestCubeCentricHoverHack:
         assert get_subgoal_space("PickCube-v1", "cube_centric").dim == 3
         assert get_subgoal_space("PickCube-v1").dim == 6        # default unchanged
         assert get_subgoal_space("PickCube-v1", "hiro").dim == 6
+
+
+# ---------------------------------------------------------------------------
+# Fetch robot support (additive): "fetch" routes to the 54-dim obs layout;
+# panda + weak-panda variants must keep using the Panda 42-dim layout.
+# ---------------------------------------------------------------------------
+
+from hiro.subgoal_space import (  # noqa: E402
+    get_subgoal_space,
+    get_grasp_detector,
+    get_place_residual_dims,
+    get_reach_dims,
+    _is_fetch,
+)
+
+
+def test_fetch_cube_centric_mapping():
+    sp = get_subgoal_space("PickCube-v1", "cube_centric", "fetch")
+    assert sp.indices == [41, 42, 43]
+    assert sp.obs_dim == 54
+    assert sp.object_dims == (0, 1, 2)
+
+
+def test_fetch_hiro_mapping():
+    sp = get_subgoal_space("PickCube-v1", "hiro", "fetch")
+    assert sp.indices == [31, 32, 33, 41, 42, 43]
+    assert sp.obs_dim == 54
+
+
+def test_fetch_aux_dims():
+    assert get_place_residual_dims("PickCube-v1", "fetch") == (51, 52, 53)
+    assert get_reach_dims("PickCube-v1", "fetch") == (48, 49, 50)
+    gd = get_grasp_detector("PickCube-v1", "fetch")
+    assert isinstance(gd, ObsBitGraspReader) and gd.obs_index == 30
+
+
+def test_panda_and_weak_variants_unchanged():
+    # default (panda) path
+    sp = get_subgoal_space("PickCube-v1", "cube_centric")
+    assert sp.indices == [29, 30, 31] and sp.obs_dim == 42
+    # weak-panda variants share the Panda layout (NOT fetch)
+    for r in ("panda", "weakdampedpanda", "scaledpanda", "dampedpanda"):
+        assert not _is_fetch(r)
+        assert get_subgoal_space("PickCube-v1", "cube_centric", r).obs_dim == 42
+        assert get_place_residual_dims("PickCube-v1", r) == (39, 40, 41)
+        assert get_grasp_detector("PickCube-v1", r).obs_index == 18
+    assert _is_fetch("fetch") and _is_fetch("fetch_wristcam")

@@ -21,9 +21,16 @@ import torch
 #   [18:21] tcp_xyz, [25:28] cubeA_xyz, [32:35] cubeB_xyz (goal = on top of cubeB)
 PICKCUBE_LAYOUT = {"tcp": (19, 22), "obj": (29, 32), "goal": (26, 29)}
 STACKCUBE_LAYOUT = {"tcp": (18, 21), "obj": (25, 28), "goal": (32, 35)}
+# Fetch PickCube-v1 (54-dim state obs): tcp@31, goal@38, cube@41 (see subgoal_space.py).
+FETCH_PICKCUBE_LAYOUT = {"tcp": (31, 34), "obj": (41, 44), "goal": (38, 41)}
 
 
-def make_oracle(env_id: str, scale: float, grasp_detector, cube_only: bool = False):
+def _is_fetch(robot_uids) -> bool:
+    return isinstance(robot_uids, str) and robot_uids.startswith("fetch")
+
+
+def make_oracle(env_id: str, scale: float, grasp_detector, cube_only: bool = False,
+                robot_uids: str = "panda"):
     """Return an oracle subgoal function: obs (B, obs_dim) -> g (B, subgoal_dim).
 
     Pre-grasp:  g_tcp = (cube - tcp);              g_obj = 0  (cube can't be moved anyway)
@@ -36,7 +43,10 @@ def make_oracle(env_id: str, scale: float, grasp_detector, cube_only: bool = Fal
     cube_only=True (Phase 5 cube-centric mode): return ONLY the object subgoal
     g_obj (B, 3) -- matches the cube-only subgoal space (no TCP dims).
     """
-    if env_id == "PickCube-v1":
+    if _is_fetch(robot_uids) and env_id == "PickCube-v1":
+        layout = FETCH_PICKCUBE_LAYOUT
+        z_lift = 0.0
+    elif env_id == "PickCube-v1":
         layout = PICKCUBE_LAYOUT
         z_lift = 0.0
     elif env_id == "StackCube-v1":

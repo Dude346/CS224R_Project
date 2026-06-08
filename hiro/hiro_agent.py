@@ -84,6 +84,12 @@ class HIROConfig:
     # manager-load-bearing test is clean. reach_dims = obs indices of tcp->object.
     reach_pbrs_weight: float = 0.0
     reach_dims: tuple = ()
+    # Body-independent manager (cross-robot transfer): obs indices of the
+    # object-centric features [tcp_xyz, cube_xyz, goal_xyz] the manager observes
+    # INSTEAD of the full robot-specific obs. () => full obs (default; unchanged).
+    # A manager trained on these body-independent dims transfers across robots with
+    # different obs sizes (e.g. panda 42-D -> fetch 54-D); the worker stays full-obs.
+    manager_input_dims: tuple = ()
     hidden_dim: int = 256
     n_hidden: int = 3
     device: str = "cpu"
@@ -112,12 +118,19 @@ class HIROAgent:
         sg_dim = subgoal_space.dim
         act_dim = cfg.action_dim
 
+        # Body-independent manager: it observes only obs[manager_input_dims]
+        # (object features), so its learned weights transfer across embodiments.
+        # () => full obs (original behaviour). The worker always sees full obs.
+        self._mgr_dims = list(cfg.manager_input_dims) if cfg.manager_input_dims else None
+        manager_obs_dim = len(self._mgr_dims) if self._mgr_dims is not None else obs_dim
+
         # --- networks (online) ---
         self.nets: HIRONetworks = build_hiro_networks(
             obs_dim=obs_dim, subgoal_dim=sg_dim, action_dim=act_dim,
             action_low=cfg.action_low, action_high=cfg.action_high,
             subgoal_scale=cfg.subgoal_scale,
             hidden_dim=cfg.hidden_dim, n_hidden=cfg.n_hidden,
+            manager_obs_dim=manager_obs_dim,
         ).to(self.device)
 
         # --- target critics (frozen copies) ---
@@ -254,12 +267,18 @@ class HIROAgent:
         action, _, _ = self.nets.worker_actor.get_action(state)
         return action
 
+    def _mgr_in(self, obs):
+        """Slice obs to the manager's (optionally body-independent) input.
+        Identity when manager_input_dims is empty (full-obs manager, default)."""
+        return obs[..., self._mgr_dims] if self._mgr_dims is not None else obs
+
     @torch.no_grad()
     def select_subgoal(self, obs, deterministic: bool = False):
         """Manager subgoal from obs."""
+        obs_m = self._mgr_in(obs)
         if deterministic:
-            return self.nets.manager_actor.get_eval_action(obs)
-        subgoal, _, _ = self.nets.manager_actor.get_action(obs)
+            return self.nets.manager_actor.get_eval_action(obs_m)
+        subgoal, _, _ = self.nets.manager_actor.get_action(obs_m)
         return subgoal
 
     # ------------------------------------------------------------------
@@ -432,8 +451,8 @@ class HIROAgent:
             critic_target=self.manager_critic_target,
             optims=self.high,
             gamma=self.cfg.gamma_high,
-            state=batch.s0, action=action, reward=reward,
-            next_state=batch.s_c, done=batch.done,
+            state=self._mgr_in(batch.s0), action=action, reward=reward,
+            next_state=self._mgr_in(batch.s_c), done=batch.done,
         )
 
     # ------------------------------------------------------------------

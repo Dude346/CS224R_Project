@@ -328,20 +328,82 @@ GRASP_DETECTORS: dict[str, GraspReader] = {
 }
 
 
-def get_grasp_detector(env_id: str) -> "GraspReader | None":
+# ---------------------------------------------------------------------------
+# FETCH robot support (PickCube-v1). ADDITIVE: the Panda / weak-panda obs layout
+# is unchanged; only robot_uids starting with "fetch" routes to these tables.
+#
+# Fetch PickCube-v1 flat obs (54 dims, obs_mode="state", pd_joint_delta_pos):
+#   [0:30]  agent proprioception (Fetch has a larger joint set than Panda)
+#   [30]    extra.is_grasped
+#   [31:38] extra.tcp_pose      -> [31:34] xyz  [34:38] quat
+#   [38:41] extra.goal_pos
+#   [41:48] extra.obj_pose      -> [41:44] xyz  [44:48] quat
+#   [48:51] extra.tcp_to_obj_pos
+#   [51:54] extra.obj_to_goal_pos
+# tcp_xyz@31 / goal@38 / cube@41 value-matched on a live Fetch env
+# (modal_inspect_fetch_obs.py); is_grasped@30 + the two delta vectors follow from
+# ManiSkill's fixed _get_obs_extra ordering.
+# ---------------------------------------------------------------------------
+
+FETCH_HIRO_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
+    "PickCube-v1": SubgoalSpace(
+        indices=[31, 32, 33,   # tcp_xyz  (HAND)
+                 41, 42, 43],  # cube_xyz (OBJECT)
+        obs_dim=54,
+        label="fetch tcp_xyz+cube_xyz",
+        object_dims=(3, 4, 5),
+    ),
+}
+
+FETCH_CUBE_CENTRIC_SUBGOAL_SPACES: dict[str, SubgoalSpace] = {
+    "PickCube-v1": SubgoalSpace(
+        indices=[41, 42, 43],          # cube_xyz only
+        obs_dim=54,
+        label="fetch cube_xyz (object-centric)",
+        object_dims=(0, 1, 2),
+    ),
+}
+
+FETCH_GRASP_DETECTORS: dict[str, GraspReader] = {
+    "PickCube-v1": ObsBitGraspReader(obs_index=30),
+}
+
+FETCH_PLACE_RESIDUAL_DIMS: dict[str, tuple[int, ...]] = {
+    "PickCube-v1": (51, 52, 53),
+}
+
+FETCH_REACH_DIMS: dict[str, tuple[int, ...]] = {
+    "PickCube-v1": (48, 49, 50),
+}
+
+
+def _is_fetch(robot_uids: "str | None") -> bool:
+    """True for the Fetch robot (and its wristcam variant). Everything else
+    (panda + weak/damped/scaled panda variants) shares the Panda obs layout."""
+    return isinstance(robot_uids, str) and robot_uids.startswith("fetch")
+
+
+def get_grasp_detector(env_id: str, robot_uids: str = "panda") -> "GraspReader | None":
+    if _is_fetch(robot_uids):
+        return FETCH_GRASP_DETECTORS.get(env_id)
     return GRASP_DETECTORS.get(env_id)
 
 
-def get_subgoal_space(env_id: str, mode: str = "hiro") -> SubgoalSpace:
+def get_subgoal_space(env_id: str, mode: str = "hiro", robot_uids: str = "panda") -> SubgoalSpace:
     """Return the subgoal space for the given env.
 
     mode="hiro"         : canonical tcp+object positions (default; original).
     mode="cube_centric" : object-only positions (Phase 5; kills the hover hack).
+    robot_uids          : "fetch" routes to the Fetch obs layout; anything else
+                          (panda + weak-panda variants) uses the Panda layout.
     """
-    table = CUBE_CENTRIC_SUBGOAL_SPACES if mode == "cube_centric" else HIRO_SUBGOAL_SPACES
+    if _is_fetch(robot_uids):
+        table = FETCH_CUBE_CENTRIC_SUBGOAL_SPACES if mode == "cube_centric" else FETCH_HIRO_SUBGOAL_SPACES
+    else:
+        table = CUBE_CENTRIC_SUBGOAL_SPACES if mode == "cube_centric" else HIRO_SUBGOAL_SPACES
     if env_id not in table:
         raise ValueError(
-            f"No {mode} subgoal space defined for {env_id!r}. Known envs: {list(table)}"
+            f"No {mode} subgoal space defined for {env_id!r} (robot={robot_uids!r}). Known envs: {list(table)}"
         )
     return table[env_id]
 
@@ -360,8 +422,10 @@ PLACE_RESIDUAL_DIMS: dict[str, tuple[int, ...]] = {
 }
 
 
-def get_place_residual_dims(env_id: str) -> "tuple[int, ...] | None":
+def get_place_residual_dims(env_id: str, robot_uids: str = "panda") -> "tuple[int, ...] | None":
     """Obs indices of the cube->goal vector (||.|| = cube-to-goal distance)."""
+    if _is_fetch(robot_uids):
+        return FETCH_PLACE_RESIDUAL_DIMS.get(env_id)
     return PLACE_RESIDUAL_DIMS.get(env_id)
 
 
@@ -377,6 +441,32 @@ REACH_DIMS: dict[str, tuple[int, ...]] = {
 }
 
 
-def get_reach_dims(env_id: str) -> "tuple[int, ...] | None":
+def get_reach_dims(env_id: str, robot_uids: str = "panda") -> "tuple[int, ...] | None":
     """Obs indices of the tcp->object vector (||.|| = gripper-to-object distance)."""
+    if _is_fetch(robot_uids):
+        return FETCH_REACH_DIMS.get(env_id)
     return REACH_DIMS.get(env_id)
+
+
+# ---------------------------------------------------------------------------
+# Body-independent MANAGER INPUT: the object-centric features the manager reads
+# instead of the full robot-specific obs -> [tcp_xyz, cube_xyz, goal_xyz] (9-D).
+# These are the SAME semantic features on every robot (just at different obs
+# indices), so a manager trained on them transfers across embodiments with
+# different obs sizes (panda 42-D <-> fetch 54-D). PickCube only for now.
+# ---------------------------------------------------------------------------
+
+MANAGER_INPUT_DIMS: dict[str, tuple[int, ...]] = {
+    "PickCube-v1": (19, 20, 21, 29, 30, 31, 26, 27, 28),  # tcp_xyz, cube_xyz, goal_xyz
+}
+
+FETCH_MANAGER_INPUT_DIMS: dict[str, tuple[int, ...]] = {
+    "PickCube-v1": (31, 32, 33, 41, 42, 43, 38, 39, 40),  # tcp_xyz, cube_xyz, goal_xyz
+}
+
+
+def get_manager_input_dims(env_id: str, robot_uids: str = "panda") -> "tuple[int, ...] | None":
+    """Obs indices of the body-independent manager input [tcp,cube,goal] (9-D)."""
+    if _is_fetch(robot_uids):
+        return FETCH_MANAGER_INPUT_DIMS.get(env_id)
+    return MANAGER_INPUT_DIMS.get(env_id)

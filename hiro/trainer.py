@@ -30,7 +30,7 @@ from hiro.hiro_agent import HIROAgent, HIROConfig
 from hiro.replay_buffer import HighLevelBuffer, LowLevelBuffer
 from hiro.rollout import HierarchicalRollout
 from hiro.oracle import make_oracle
-from hiro.subgoal_space import get_grasp_detector, get_place_residual_dims, get_reach_dims, get_subgoal_space
+from hiro.subgoal_space import get_grasp_detector, get_manager_input_dims, get_place_residual_dims, get_reach_dims, get_subgoal_space
 
 
 @dataclass
@@ -43,6 +43,7 @@ class TrainArgs:
     num_envs: int = 32
     num_eval_envs: int = 16
     num_eval_steps: int = 50
+    render_size: int = 512            # human-render camera resolution (square px)
     eval_freq: int = 50_000           # in env steps
     learning_starts: int = 4_000
     training_freq: int = 64           # env steps between update phases
@@ -92,6 +93,11 @@ class TrainArgs:
     # and re-adapt only the worker on a new embodiment.
     pretrained_manager_ckpt: str = ""
     freeze_manager: bool = False      # don't train the manager (skip update_high); it still acts
+    # Body-independent manager: "full" (default) = manager reads the full obs (original);
+    # "object" = manager reads only [tcp,cube,goal] (9-D), so its learned weights transfer
+    # across robots with different obs sizes (panda<->fetch). Enables the Option-B
+    # learned-manager cross-embodiment transfer.
+    manager_input_mode: str = "full"
     # partial_reset=True: episodes end on TRUE termination (env success), not just
     # horizon. Defaults ON for HIRO (avoids per-step PBRS hold-cost drag after
     # success). Flat SAC baselines used False to match upstream.
@@ -134,7 +140,7 @@ def build_envs(args: TrainArgs, run_name: str):
                     reconfiguration_freq=None, **env_kwargs)
     eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs,
                          reconfiguration_freq=1,
-                         human_render_camera_configs=dict(shader_pack="default"),
+                         human_render_camera_configs=dict(shader_pack="default", width=args.render_size, height=args.render_size),
                          **env_kwargs)
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
@@ -186,7 +192,7 @@ def evaluate(agent: HIROAgent, eval_envs, args: TrainArgs) -> dict:
     # Phase-2 campaign diagnostics. place_dims = obs indices of the cube->goal
     # vector (extra.obj_to_goal_pos = goal - cube), so ||obs[place_dims]|| is the
     # cube-to-goal distance and its direction is "where the cube should go".
-    place_dims = get_place_residual_dims(args.env_id)
+    place_dims = get_place_residual_dims(args.env_id, args.robot_uids)
     place_dims_t = torch.tensor(place_dims, device=device, dtype=torch.long) if place_dims else None
     obj_pos = agent.sp.object_positions  # positions within the subgoal that target the cube
     place_dist_sum, place_dist_n = 0.0, 0
@@ -271,10 +277,23 @@ def train(args: TrainArgs) -> str:
     low = np.asarray(envs.single_action_space.low).reshape(-1)
     high = np.asarray(envs.single_action_space.high).reshape(-1)
 
-    sp = get_subgoal_space(args.env_id, args.subgoal_mode)
+    sp = get_subgoal_space(args.env_id, args.subgoal_mode, args.robot_uids)
     assert sp.obs_dim == obs_dim, f"subgoal space obs_dim {sp.obs_dim} != env obs_dim {obs_dim}"
     if args.subgoal_mode != "hiro":
         print(f"SUBGOAL MODE = {args.subgoal_mode}: {sp!r} indices={sp.indices} object_dims={sp.object_dims}")
+
+    # Body-independent manager input (Option-B cross-robot transfer). "object" =>
+    # manager reads only [tcp,cube,goal] (9-D); "full" (default) => full obs.
+    mgr_dims: tuple = ()
+    if args.manager_input_mode == "object":
+        md = get_manager_input_dims(args.env_id, args.robot_uids)
+        if not md:
+            raise RuntimeError(
+                f"manager_input_mode='object' but no manager_input_dims for "
+                f"{args.env_id!r}/{args.robot_uids!r}")
+        mgr_dims = tuple(md)
+        print(f"BODY-INDEPENDENT MANAGER on: input=obs[{list(mgr_dims)}] "
+              f"(tcp,cube,goal 9-D) -- manager weights transfer across robots.")
 
     cfg = HIROConfig(
         action_dim=act_dim, c=args.c, subgoal_scale=args.subgoal_scale,
@@ -286,11 +305,12 @@ def train(args: TrainArgs) -> str:
         use_phased_reward=args.use_phased_reward, pbrs_alpha=args.pbrs_alpha,
         worker_extrinsic_weight=args.worker_extrinsic_weight,
         place_pbrs_beta=args.place_pbrs_beta,
-        place_residual_dims=tuple(get_place_residual_dims(args.env_id) or ())
+        place_residual_dims=tuple(get_place_residual_dims(args.env_id, args.robot_uids) or ())
             if args.place_pbrs_beta > 0.0 else (),
         reach_pbrs_weight=args.reach_pbrs_weight,
-        reach_dims=tuple(get_reach_dims(args.env_id) or ())
+        reach_dims=tuple(get_reach_dims(args.env_id, args.robot_uids) or ())
             if args.reach_pbrs_weight > 0.0 else (),
+        manager_input_dims=mgr_dims,
         device=args.device,
     )
     agent = HIROAgent(sp, cfg)
@@ -305,7 +325,7 @@ def train(args: TrainArgs) -> str:
         print(f"MANAGER place-PBRS on: Phi=-{args.place_pbrs_beta}*||cube-goal|| "
               f"(cube->goal dims={cfg.place_residual_dims}, gamma_high={args.gamma_high})")
     if args.use_phased_reward:
-        agent.grasp_detector = get_grasp_detector(args.env_id)
+        agent.grasp_detector = get_grasp_detector(args.env_id, args.robot_uids)
         print(f"phased worker reward (PBRS): detector={'set' if agent.grasp_detector else 'NONE'} "
               f"| object_dims={sp.object_positions} | pbrs_alpha={args.pbrs_alpha} "
               f"| gamma_low={args.gamma_low}")
@@ -317,7 +337,8 @@ def train(args: TrainArgs) -> str:
         if agent.grasp_detector is None:
             raise RuntimeError("oracle_manager requires a grasp detector for the env")
         oracle = make_oracle(args.env_id, args.subgoal_scale, agent.grasp_detector,
-                             cube_only=(args.subgoal_mode == "cube_centric"))
+                             cube_only=(args.subgoal_mode == "cube_centric"),
+                             robot_uids=args.robot_uids)
         agent.select_subgoal = oracle           # monkey-patch: ignore manager_actor
         print(f"ORACLE MANAGER on -- worker-only diagnostic. Manager will NOT be trained.")
 

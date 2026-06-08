@@ -66,6 +66,25 @@ Mined worker exploration + reward-decomposition tags across all screens:
 4. Pretrained worker low/alpha=0.001 flat (near-deterministic from load) yet competent; mean_manager_reward ->2.26 (~2x from-scratch's ~1.0). Same ~0 exploration, opposite grasp (95% vs 2-3%) => discriminator is converged-policy QUALITY (reward landscape), not exploration level.
 CONCLUSION: from-scratch wall = hover-hackable reward. Phase 5 (cube-centric) is the principled fix; its running screens are the direct test (watch grasp_rate + mean_intrinsic_reward rise together).
 
+## !!! 3-SEED M2 REPRODUCTION: NOT ROBUST (critical, tempers the headline) [2026-06-01]
+M2 (cube-centric, no-OPC, w=0.5) across seeds 1/2/3:
+- seed1 (orig M2): SOLVED 100% (success 1.0).
+- seed2: success 0.000 @275k, reward 0.471, sg_align -0.38 (NEGATIVE). NO solve.
+- seed3: success 0.062 (noise) @300k, reward 0.450, sg_align -0.33 (NEGATIVE). NO solve.
+=> **1/3 seeds solve. The M2 solve is NOT robust -- high variance.** Seeds 2/3 plateau at ~0.47 / success~0 (the old env-driven plateau) with NEGATIVE sg_align (manager points AWAY, like correction-ON M1). seed1 was a lucky tip into a solve.
+IMPLICATIONS: (a) "first learned solve" is real but a 1/3 outcome, not reliable. (b) F8 (off-policy correction harmful) is WEAKER than thought -- the M1(ON)-vs-M2(OFF) comparison was 1 seed each, and no-OPC solves only 1/3; removing the correction reduces harm on average but does NOT reliably produce a solving/load-bearing manager. (c) Honest framing: "no-OPC cube-centric HIRO solves PickCube on 1/3 seeds (high variance)."
+
+## STACKCUBE Exp 0 (oracle) NOT SOLVING @250k -- plumbing suspect; scout HELD [2026-06-01]
+Oracle StackCube: success 0 through 250k; ever_grasped LOW + erratic (0.12-0.38) [an ORACLE should grasp ~reliably, like PickCube's ~1.0]; place_dist(cubeA->cubeB) 0.176->0.094; cube@goal 0.01->0.205; sg_align very noisy (-0.39..+0.73).
+StackCube facts (from stack_cube.py): cube_half=0.02 (cubeA rest center z=0.02); success = cubeA-on-cubeB AND static AND **NOT grasped (must RELEASE)**; success uses the TRUE force-based is_grasping (NOT in our 48-D obs).
+HYPOTHESIS: our positional grasp heuristic (lift_threshold=0.035 vs cubeA rest z=0.02) likely UNDER-reports grasp when the worker grasps/carries cubeA low -> cube_only oracle (gates the stack target on the heuristic) keeps commanding g_obj=0 -> no stack subgoal -> partial stacking, no completion. Also success needs RELEASE, which the heuristic can't see.
+DECISION (per Exp0 gate): oracle NOT solving -> **do NOT launch the learned scout.** Let Exp0 run for more evidence (next wakeup); candidate fix = lower StackCube lift_threshold (~0.025) and verify release, before any learned StackCube run. HOLDING.
+
+## OVERNIGHT (autonomous) findings [2026-06-01]
+WEAKDAMPED TRANSFER (negative result, FINAL both 300k, same seed 1): A=from-scratch **success 0.688**, reward 0.599 (climbed 0.19->0.375->0.688); B=transfer frozen-M2-mgr+fresh-worker **success 0.062**, reward 0.46, sg_align -0.33. **A (from-scratch) ~11x > B (transfer) = strong NEGATIVE transfer.** Same seed -> the only diff is the frozen manager, which CONSTRAINS the worker to bad subgoals (caps at 0.06) vs co-adapting from scratch (0.69). Frozen M2 manager (not load-bearing; sg_align ~0.25 normal, -0.33 weakdamped) gives NO head start -- freezing a mediocre manager constrains the worker; from-scratch co-adaptation wins. Consistent with F10 (nothing good to reuse). [both partial; weakdamped harder than normal.]
+STACKCUBE oracle still NOT solving with fixes (lift0.025+reach1.0): @250k success 0, ever_grasped 0.25-0.38 (vs ~1.0 PickCube), place_dist(cubeA->cubeB) 0.14 (~unmoved), cube@goal 0.025, sg_align +0.88 (oracle subgoals fine WHEN grasped). NOT horizon (StackCube max_episode_steps=50=PickCube, eval=50). => blocker = GRASP+CARRY of cubeA: worker grasps cubeA only ~30%. StackCube grasping (2 cubes) genuinely harder. Launched grasp-push variant: oracle w=0.7 + reach 2.0 (hiro_stk_E0d_oracle_w70_reach20_cubeCentric_seed1_500k).
+ROBUSTNESS (too early @75-100k): pPBRS_s2 sg_align +0.25 (promising), pPBRS_s3 -0.18, w70 mixed. Verdict pending ~200-300k.
+
 ## STACKCUBE SCOUT CAMPAIGN [2026-06-01]
 Question: does a MULTI-STAGE task make the learned manager load-bearing (sg_align climbs >> PickCube's ~0.25 toward the oracle ceiling, holds as w->0)? F10 predicts yes. SCOUT before building the full matrix; gating metric = sg_align (NOT reward).
 - **Exp 0 (FIRST, plumbing + ceiling):** oracle StackCube = cube_only oracle + cube-centric subgoal + w=0.5, 1M. Validate release / grasp heuristic / stack detector / staged subgoal; establish the sg_align ceiling. MUST SOLVE before any learned run is interpretable. LAUNCHED hiro_stk_E0_oracle_cubeCentric_w50_seed1_1M. Watch: success/stack-rate, release works?, cubeA->cubeB place_dist drops, oracle sg_align (~0.8 expected). Likely-bug to watch: positional grasp heuristic may falsely read "grasped" when cubeA rests ON cubeB (both elevated).
@@ -140,3 +159,32 @@ VERDICT: **HOVER-HACK DIAGNOSIS CONFIRMED + FIXED.** Cube-centric raised grasp_r
 
 ## Phase 5 BUILT (cube-centric grasp-gated subgoal) [2026-05-31]
 Code: CUBE_CENTRIC_SUBGOAL_SPACES (PickCube indices [29,30,31], object_dims=(0,1,2) => hand_positions empty => hand_term==0 in phased_pbrs); get_subgoal_space(env,mode); trainer/modal subgoal_mode flag; make_oracle(cube_only=) for an oracle sanity check. Worker earns intrinsic ONLY via grasp PBRS + grasp-gated cube term; pre-grasp guidance from hybrid env reward. Tested: 128 pass incl. hover-hack regression (not-grasped gripper motion -> reward 0 in cube-centric vs farmable in old space) + end-to-end 3D-subgoal agent (te_high=-8.69). READY to launch as a from-scratch screen (subgoal_mode=cube_centric, w=0.5, g08; optionally + place_pbrs_beta).
+
+## RIGOROUS TRANSFER VERIFICATION [2026-06-01] -- HIRO zero-shot transfer is REAL
+Source policy: M2 seed-1 (hiro_M2_noOPC_cubeCentric_w50_seed1_300k), whole arm (manager+worker, all weights) loaded.
+Eval = 256 episodes (num_eval_envs=256), step-0 zero-shot (no fine-tuning). Corrects the prior 16/16 "100%" small-sample read.
+  panda (native/control):  success 0.988 (253/256)  reward 0.768  grasp 1.00  -- loading verified; true ceiling ~98.8%
+  weakdampedpanda (0.75 force,1.5 damp): success 0.980 (251/256)  reward 0.762  grasp 1.00  -- ~1pp below native = noise
+  scaledpanda (0.75 action scale):       success 0.977 (250/256)  reward 0.698  grasp 1.00  -- perturbation ACTIVE (reward/cube@goal drop) but success holds
+VERDICT: whole-policy zero-shot transfer is statistically indistinguishable from native (~98%). The earlier overnight "negative transfer" (0.06) was a RANDOM-WORKER artifact (discarded the learned worker), NOT real.
+CAVEAT/CRUX: these perturbations are mild -> the decisive thesis test is whether Vanilla SAC zero-shot degrades MORE than HIRO on weakdamped (user has SAC numbers). If SAC<<98% -> HIRO robustness wins; if SAC~98% -> perturbation too easy to separate.
+TODO to harden: (a) 256-ep transfer eval on w=0.7 seed-2/seed-3 solvers (multi-source); (b) harder perturbation that breaks zero-shot (needs more-aggressive robot in weak_panda.py -- permission required).
+
+## SAC vs HIRO TRANSFER HEAD-TO-HEAD [2026-06-01] -- weakdamped, joint, seed1 (apples-to-apples)
+SAC run: ft_sac_PickCube_v1_weakdampedpanda_pd_joint_delta_pos_seed1_500000steps_WEAKDAMPED_force075_damping15_finetune (eval ~16 env)
+HIRO run: hiro_xfer_WHOLEarm_ft_weakdamped_seed1_eval256_200k (eval 256 env), whole arm (mgr+worker) loaded, fine-tune all weights.
+ONE-SHOT (step0):  SAC success 1.000 (reward .743) | HIRO 0.980 (reward .762)  => TIED ~100%. weakdamped too mild to separate on one-shot. NO one-shot claim here.
+FINE-TUNE trajectory (success_once):
+  SAC : 0:1.00 -> 50k:0.00(CRATER) -> 100k:0.81 -> 150k:0.94 -> 200k:1.00   (catastrophic forgetting, relearns over ~150k)
+  HIRO: 0:0.98 -> 25k:0.73(floor) -> 50k:0.78 -> 100k:0.88 -> 150k:0.93 -> 200k:0.96   (graceful dip, monotonic recovery)
+CLAIM (defensible): flat SAC suffers CATASTROPHIC FORGETTING on embodiment fine-tune (->0%); HIRO degrades GRACEFULLY (floor ~73%, never collapses). Likely mechanism: body-independent object-centric manager keeps emitting valid cube-subgoals while worker re-adapts = stabilizing scaffold SAC lacks.
+NOTE: for BOTH, fine-tuning a near-optimal warm policy is net unnecessary/harmful here (HIRO 0.98 zero-shot > 0.96 fine-tuned; SAC wastes 150k recovering). Right move = use zero-shot.
+TODO: (a) seed-2 repeat of the SAC-crater vs HIRO-graceful contrast; (b) one-shot claim needs a HARDER embodiment (Fetch = genuinely different robot; weak_panda perturbations too mild).
+
+## P1 MECHANISM SHOT: frozen vs unfrozen manager during weakdamped fine-tune [2026-06-01]
+Both load whole M2 (warm manager+worker), fine-tune the worker on weakdampedpanda; (a) manager FROZEN, (b) UNFROZEN. 256-ep eval, 200k, seed1.
+  success_once  step:   0     25k    50k    100k   150k   200k
+  frozen   (a):        0.980  0.695  0.832  0.848  0.949  0.961
+  unfrozen (b):        0.980  0.730  0.777  0.875  0.934  0.957
+=> FROZEN ~= UNFROZEN: both dip to ~0.70 @25k and recover to ~0.96 @200k. Freezing the manager does NOT add stability.
+INTERPRETATION (honest): the adaptation stability (vs flat SAC's crater to 0% @50k) is a property of the OBJECT-CENTRIC HIERARCHY -- the worker is goal-conditioned on a well-shaped cube-target objective that stays sensible throughout re-adaptation -- NOT of freezing the manager specifically. This is a cleaner, more robust claim than "frozen reference." fig1 is now a 3-line figure (SAC crater / HIRO unfrozen / HIRO frozen, the two HIRO lines overlapping).

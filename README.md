@@ -63,8 +63,3 @@ cross-embodiment transfer runs.
 ```bash
 uv run pytest
 ```
-
-## Report
-
-Methods, experiments, and results are written up in the project report
-(`CS_224R_Project_Final_Report.pdf`).

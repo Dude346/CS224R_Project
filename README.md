@@ -1,4 +1,4 @@
-# Object-Centric Hierarchical RL for Embodiment Transfer
+# Failing to Grasp the Point: Hierarchical Reinforcement Learning for Grasping Tasks
 
 Stanford CS224R final project.
 
